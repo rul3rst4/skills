@@ -1,11 +1,46 @@
 ---
 name: codex-workflow-runner
-description: Execute and inspect Codex dynamic workflow scripts. Use when the user asks to run, prototype, reverse-engineer, validate, resume, or build a self-made version of Codex dynamic workflows with phases, agent fan-out, pipeline/parallel orchestration, schema-shaped child outputs, journals, and child Codex delegation.
+description: Execute and inspect Codex dynamic workflows. Use when the user asks to run, prototype, reverse-engineer, validate, resume, or build Codex workflows with phases, agent fan-out, pipeline/parallel orchestration, schema-shaped child outputs, journals, native Codex thread delegation, or child Codex CLI delegation.
 ---
 
 # Codex Workflow Runner
 
-Run Codex dynamic workflow scripts with a bundled clean-room runtime. Use this for deterministic multi-agent orchestration where a parent Codex instance should author or execute JavaScript workflow scripts that call `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`, and `workflow()`.
+Run Codex dynamic workflows. Prefer native Codex thread orchestration when it is available in the current Codex app session; use the bundled clean-room JavaScript runtime when the workflow needs to be portable, repeatable from a terminal, resumable from runner journals, or executed outside Codex Desktop.
+
+## Mode Selection
+
+Choose the execution mode before authoring a workflow:
+
+- **Codex Native Mode**: Use this inside Codex Desktop when thread orchestration tools are available. The parent Codex instance should fan out work with background threads, read their results, integrate accepted findings or patches, and own final verification. This is the most Codex-native path for research, review, implementation planning, and fan-out/fan-in tasks where native app context matters.
+- **Portable CLI Mode**: Use the bundled Node runner for deterministic JavaScript workflow scripts that call `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`, and `workflow()`. This path works in terminals, CI, non-Desktop installs, and environments where native thread tools are unavailable.
+
+When both modes could work, prefer Codex Native Mode for user-facing Codex sessions and use Portable CLI Mode when the user explicitly asks for a runnable `workflow.js`, CLI artifacts, journal replay, mock mode, or repeatable workflow execution.
+
+The Node runner cannot directly call Codex app-native thread or multi-agent tools. Treat the runner as the portable fallback rather than trying to bridge native orchestration tools from JavaScript.
+
+## Codex Native Mode
+
+When native thread tools are available, the main Codex instance is the orchestrator:
+
+1. Discover the available native orchestration tools before fan-out. Depending on the Codex environment, this may be a thread API such as `create_thread` / `send_message_to_thread` / `read_thread`, a multi-agent API such as `spawn_agent` / `send_input` / `wait_agent` / `close_agent`, or another app-native surface. Use the tools that are actually exposed in the session.
+2. Derive the workflow shape from the task: unit of work, source of truth, independent work, serialized work, verification gate, and failure mode.
+3. Create child threads for independent discovery, review, verification, or file-disjoint implementation. Give each child a narrow prompt, expected output shape, workspace context, success criteria, and any active Goal objective.
+4. Keep the parent responsible for integration. Child threads can propose patches or findings, but the parent should verify evidence, apply accepted changes, run tests, and synthesize the final answer.
+5. Archive or title child threads when useful for traceability, but do not make thread management the source of truth. The parent summary, repo diff, tests, and final verification are authoritative.
+
+Use native threads for fan-out/fan-in, not for handing off ownership of the whole task. The parent stays accountable for the user's objective.
+
+### Goal Awareness
+
+If an active Codex Goal exists, treat it as the top-level objective contract:
+
+- Include the Goal objective in child thread prompts and synthesis prompts when it helps keep work aligned.
+- Do not ask child threads to mark the Goal complete or blocked.
+- The parent thread updates Goal state only after integration and verification show the objective is genuinely complete or blocked.
+
+### Autoreview Closeout
+
+If code changes were made and the `autoreview` skill is available, run autoreview after tests on the integrated diff. Use autoreview as a final closeout gate in the parent thread, not inside every child thread. Verify any accepted findings against the actual code path before applying fixes; if fixes change the diff, rerun focused tests and autoreview.
 
 ## Orchestrator Mode
 
@@ -15,11 +50,11 @@ Default loop:
 
 1. Infer the target workspace/app from the current directory and prompt. Ask only if the app/scope cannot be discovered or if the next step would be risky.
 2. Inspect the repo enough to pick lenses, success criteria, risk gates, and verification commands.
-3. Author a local `workflow.js` under `.codex-workflows/authored/` using the script contract below. Prefer the `template throughput` command as a starting point for throughput work, then customize it to the repo.
-4. Run `inspect` on the authored script and check the phase/agent estimate.
-5. Run the workflow with child Codex agents. Use `read-only` for assessment/review workflows and `workspace-write` only for narrow implementation workers the user requested or approved.
-6. Inspect `workflow.json` and `journal.jsonl`. Reject malformed, uncited, or unverified child outputs.
-7. Synthesize the result in the parent. If the goal requires code changes, implement the accepted changes yourself or author a second narrow fix workflow, then run verification.
+3. Choose Codex Native Mode when thread tools are available and the user does not require a portable script. Otherwise author a local `workflow.js` under `.codex-workflows/authored/` using the script contract below.
+4. In Codex Native Mode, create focused child threads for independent work, read their results, reject malformed or unverified outputs, and synthesize in the parent.
+5. In Portable CLI Mode, prefer the `template throughput` command as a starting point for throughput work, run `inspect`, execute the workflow, then inspect `workflow.json` and `journal.jsonl`.
+6. If the goal requires code changes, implement the accepted changes in the parent or author a second narrow fix workflow, then run verification.
+7. If code changed and `autoreview` is available, run it on the integrated diff before finalizing.
 
 Before authoring, derive the loop from the task mechanics. Codex workflows are not a fixed list of phase names; they are control loops that transform uncertainty into verified state changes. Build the loop by answering:
 
@@ -68,7 +103,7 @@ Use `pipeline()` when each item can advance independently. Use `parallel()` for 
 
 If a workflow is run from inside another sandboxed Codex child, nested `codex exec` may fail before model work with errors like `attempt to write a readonly database`, `failed to initialize in-process app-server client`, or disabled DNS/network. For real nested delegation, launch the outer Codex child with enough access for Codex state/app-server initialization, or run the workflow from the top-level Codex session. A mock run can still validate script mechanics, but it does not validate delegation.
 
-## Quick Start
+## Portable CLI Quick Start
 
 Use the bundled runtime directly. In a standard Codex skill install, set:
 
