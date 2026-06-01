@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Workflow Runner"
+  short_description: "Author and run Codex workflows"
+  default_prompt: "Use $codex-workflow-runner to create and run a Codex-orchestrated workflow for this task."
