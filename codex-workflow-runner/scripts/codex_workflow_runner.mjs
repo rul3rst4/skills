@@ -7,8 +7,10 @@ import vm from 'node:vm'
 import { spawn } from 'node:child_process'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads'
+import { fileURLToPath } from 'node:url'
+import { parse as parseAcorn } from './vendor/acorn.mjs'
 
-const VERSION = '0.2.0'
+const VERSION = '0.3.0'
 const DEFAULT_OUT = '.codex-workflows'
 const WORKFLOW_SYNC_TIMEOUT_MS = 1000
 
@@ -354,457 +356,294 @@ async function pathExists(filePath) {
   }
 }
 
-function scanBalanced(text, openIndex) {
-  const open = text[openIndex]
-  const close = open === '{' ? '}' : open === '(' ? ')' : open === '[' ? ']' : null
-  if (!close) throw new Error(`Unsupported opening delimiter ${open}`)
-  let depth = 0
-  let mode = 'code'
-  for (let i = openIndex; i < text.length; i++) {
-    const ch = text[i]
-    const next = text[i + 1]
-    if (mode === 'line') {
-      if (ch === '\n') mode = 'code'
-      continue
-    }
-    if (mode === 'block') {
-      if (ch === '*' && next === '/') {
-        i++
-        mode = 'code'
-      }
-      continue
-    }
-    if (mode === '"' || mode === "'" || mode === '`') {
-      if (ch === '\\') {
-        i++
-        continue
-      }
-      if (ch === mode) mode = 'code'
-      continue
-    }
-    if (ch === '/' && next === '/') {
-      i++
-      mode = 'line'
-      continue
-    }
-    if (ch === '/' && next === '*') {
-      i++
-      mode = 'block'
-      continue
-    }
-    if (ch === '"' || ch === "'" || ch === '`') {
-      mode = ch
-      continue
-    }
-    if (ch === open) depth++
-    if (ch === close) {
-      depth--
-      if (depth === 0) return i
-    }
-  }
-  throw new Error(`Unclosed ${open}`)
-}
+// ---------------------------------------------------------------------------
+// Workflow script parsing and static inspection (AST-based, via vendored acorn).
+//
+// Adapted from earendil-works/pi-dynamic-workflows (src/workflow.ts), which is
+// itself a clean-room take on Claude Code dynamic workflows. The Pi extension
+// runs subagents as in-memory sessions; this Codex runner delegates to child
+// `codex exec` processes, but shares the same deterministic, AST-validated
+// script contract: a literal `export const meta = {...}` header followed by a
+// plain-JS body that calls agent()/parallel()/pipeline()/phase()/log()/workflow().
+// ---------------------------------------------------------------------------
 
-function extractWorkflow(text) {
-  const marker = 'export const meta'
-  const codeOnly = stripStringsAndComments(text)
-  const markerIndex = codeOnly.indexOf(marker)
-  if (markerIndex < 0) throw new Error('Workflow script must begin with export const meta = {...}')
-  if (codeOnly.slice(0, markerIndex).trim()) throw new Error('Workflow script must begin with export const meta = {...}')
-  const equalsIndex = codeOnly.indexOf('=', markerIndex)
-  if (equalsIndex < 0) throw new Error('Unable to find meta assignment')
-  const objectStart = codeOnly.indexOf('{', equalsIndex)
-  if (objectStart < 0) throw new Error('Unable to find meta object literal')
-  const objectEnd = scanBalanced(text, objectStart)
-  let statementEnd = objectEnd + 1
-  while (statementEnd < text.length && /\s/.test(text[statementEnd])) statementEnd++
-  if (text[statementEnd] === ';') statementEnd++
-  const literal = text.slice(objectStart, objectEnd + 1)
-  guardPureMetaLiteral(literal)
-  const meta = evaluatePureMetaLiteral(literal)
-  if (!meta || typeof meta !== 'object') throw new Error('meta must evaluate to an object')
-  if (!meta.name || typeof meta.name !== 'string') throw new Error('meta.name is required')
-  if (!meta.description || typeof meta.description !== 'string') throw new Error('meta.description is required')
-  if (meta.phases !== undefined && !Array.isArray(meta.phases)) throw new Error('meta.phases must be an array')
-  const body = text.slice(statementEnd)
-  return { meta, scriptBody: body, metaLiteral: literal }
-}
-
-function guardPureMetaLiteral(literal) {
-  if (containsTemplateLiteral(literal)) throw new Error('meta must not use template literals')
-  const codeOnly = stripStringsAndComments(literal)
-  const banned = [
-    /\bfunction\b/,
-    /=>/,
-    /\.\.\./,
-    /\$\{/,
-    /\bnew\b/,
-    /\bDate\b/,
-    /\bMath\b/,
-    /\bprocess\b/,
-    /\brequire\b/,
-    /\bimport\b/,
-  ]
-  for (const pattern of banned) {
-    if (pattern.test(codeOnly)) throw new Error('meta must be a pure object literal')
-  }
-}
-
-function containsTemplateLiteral(text) {
-  let mode = 'code'
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]
-    const next = text[i + 1]
-    if (mode === 'line') {
-      if (ch === '\n') mode = 'code'
-      continue
-    }
-    if (mode === 'block') {
-      if (ch === '*' && next === '/') {
-        i++
-        mode = 'code'
-      }
-      continue
-    }
-    if (mode === '"' || mode === "'") {
-      if (ch === '\\') {
-        i++
-        continue
-      }
-      if (ch === mode) mode = 'code'
-      continue
-    }
-    if (ch === '/' && next === '/') {
-      i++
-      mode = 'line'
-      continue
-    }
-    if (ch === '/' && next === '*') {
-      i++
-      mode = 'block'
-      continue
-    }
-    if (ch === '"' || ch === "'") {
-      mode = ch
-      continue
-    }
-    if (ch === '`') return true
-  }
-  return false
-}
-
-function evaluatePureMetaLiteral(literal) {
-  const sandbox = Object.create(null)
-  const source = `
-(() => {
-  const meta = (${literal})
-  const own = Object.prototype.hasOwnProperty
-
-  function sanitize(value, path) {
-    if (value === null) return null
-    const type = typeof value
-    if (type === 'string' || type === 'number' || type === 'boolean') return value
-    if (type === 'undefined') return undefined
-    if (type === 'function' || type === 'symbol' || type === 'bigint') {
-      throw new Error(path + ' must contain only data values')
-    }
-    if (Array.isArray(value)) return value.map((item, index) => sanitize(item, path + '[' + index + ']'))
-    if (type !== 'object') throw new Error(path + ' must contain only data values')
-    if (Object.getOwnPropertySymbols(value).length) throw new Error(path + ' must not contain symbol keys')
-
-    const proto = Object.getPrototypeOf(value)
-    if (proto !== Object.prototype && proto !== null) throw new Error(path + ' must be a plain object')
-
-    const out = {}
-    const descriptors = Object.getOwnPropertyDescriptors(value)
-    for (const key of Object.keys(descriptors)) {
-      const descriptor = descriptors[key]
-      if (!own.call(descriptor, 'value')) throw new Error(path + '.' + key + ' must be a data property')
-      out[key] = sanitize(descriptor.value, path + '.' + key)
-    }
-    return out
-  }
-
-  return JSON.stringify(sanitize(meta, 'meta'))
-})()
-`
-  const json = vm.runInNewContext(source, sandbox, {
-    timeout: 1000,
-    contextCodeGeneration: { strings: false, wasm: false },
+function parseToAst(text) {
+  return parseAcorn(text, {
+    ecmaVersion: 'latest',
+    sourceType: 'module',
+    allowAwaitOutsideFunction: true,
+    allowReturnOutsideFunction: true,
+    ranges: false,
   })
-  return JSON.parse(json)
 }
 
-function maskNonCode(text) {
-  const out = Array.from({ length: text.length }, () => ' ')
+function isAstNode(value) {
+  return !!value && typeof value === 'object' && typeof value.type === 'string'
+}
 
-  function skipQuoted(index, quote, end) {
-    let i = index + 1
-    while (i < end) {
-      const ch = text[i]
-      if (ch === '\\') {
-        i += 2
-        continue
-      }
-      i++
-      if (ch === quote) return i
+function astChildren(node) {
+  const children = []
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) {
+      for (const item of value) if (isAstNode(item)) children.push(item)
+    } else if (isAstNode(value)) {
+      children.push(value)
     }
-    return i
   }
+  return children
+}
 
-  function copyCode(start, end, stopAtTemplateBrace = false) {
-    let i = start
-    let braceDepth = 0
-    while (i < end) {
-      const ch = text[i]
-      const next = text[i + 1]
+function propertyNameOf(node) {
+  if (!node) return undefined
+  if (!node.computed && node.property?.type === 'Identifier') return node.property.name
+  return staticStringOf(node.property)
+}
 
-      if (stopAtTemplateBrace && ch === '}' && braceDepth === 0) return i
+function staticStringOf(node) {
+  if (node?.type === 'Literal' && typeof node.value === 'string') return node.value
+  if (node?.type === 'TemplateLiteral' && node.expressions.length === 0) {
+    return node.quasis.map((quasi) => quasi.value.cooked ?? quasi.value.raw).join('')
+  }
+  if (node?.type === 'BinaryExpression' && node.operator === '+') {
+    const left = staticStringOf(node.left)
+    const right = staticStringOf(node.right)
+    if (left !== undefined && right !== undefined) return left + right
+  }
+  return undefined
+}
 
-      if (ch === '/' && next === '/') {
-        i += 2
-        while (i < end && text[i] !== '\n') i++
-        continue
-      }
-      if (ch === '/' && next === '*') {
-        i += 2
-        while (i < end) {
-          if (text[i] === '*' && text[i + 1] === '/') {
-            i += 2
-            break
-          }
-          i++
+function isMemberCall(node, objectName, propertyName) {
+  if (node?.type !== 'MemberExpression' || node.object?.type !== 'Identifier' || node.object.name !== objectName) {
+    return false
+  }
+  return propertyNameOf(node) === propertyName
+}
+
+// Determinism rules, matching the Pi extension's intent and this runner's
+// VM-level guards. `Date.now()`, `Math.random()`, and argless `new Date()` /
+// `Date()` are non-deterministic. `new Date(args.timestamp)` is allowed so
+// scripts can still work with explicit timestamps threaded through `args`.
+function isArglessDateConstruction(node) {
+  const callee = node.callee
+  if (callee?.type !== 'Identifier' || callee.name !== 'Date') return false
+  if (node.type !== 'NewExpression' && node.type !== 'CallExpression') return false
+  return (node.arguments || []).length === 0
+}
+
+function collectDeterminismWarnings(ast) {
+  const warnings = new Set()
+  const walk = (node) => {
+    if (node.type === 'CallExpression' && isMemberCall(node.callee, 'Date', 'now')) {
+      warnings.add('Date.now() is disabled in workflow scripts; pass timestamps via args.')
+    } else if (node.type === 'CallExpression' && isMemberCall(node.callee, 'Math', 'random')) {
+      warnings.add('Math.random() is disabled in workflow scripts; vary prompts by index or args instead.')
+    } else if (isArglessDateConstruction(node)) {
+      warnings.add('Argless Date is disabled in workflow scripts; pass timestamps via args.')
+    }
+    for (const child of astChildren(node)) walk(child)
+  }
+  walk(ast)
+  return [...warnings]
+}
+
+function parseWorkflowScript(text) {
+  let ast
+  try {
+    ast = parseToAst(text)
+  } catch (error) {
+    throw new Error(`Workflow script is not valid JavaScript: ${error.message}`)
+  }
+  const first = ast.body?.[0]
+  if (!first || first.type !== 'ExportNamedDeclaration') {
+    throw new Error('Workflow script must begin with export const meta = {...}')
+  }
+  const declaration = first.declaration
+  if (!declaration || declaration.type !== 'VariableDeclaration' || declaration.kind !== 'const') {
+    throw new Error('meta export must be `export const meta = ...`')
+  }
+  if (declaration.declarations.length !== 1) {
+    throw new Error('meta export must declare only `meta`')
+  }
+  const declarator = declaration.declarations[0]
+  if (declarator.id?.type !== 'Identifier' || declarator.id.name !== 'meta') {
+    throw new Error('meta export must declare `meta`')
+  }
+  if (!declarator.init) throw new Error('meta must have a literal value')
+  const meta = evaluateLiteral(declarator.init, 'meta')
+  validateMeta(meta)
+  const scriptBody = text.slice(0, first.start) + text.slice(first.end)
+  return { meta, scriptBody, ast }
+}
+
+function evaluateLiteral(node, path) {
+  switch (node.type) {
+    case 'ObjectExpression': {
+      const out = {}
+      for (const prop of node.properties) {
+        if (prop.type === 'SpreadElement') throw new Error(`spread not allowed in ${path}`)
+        if (prop.type !== 'Property') throw new Error(`only plain properties allowed in ${path}`)
+        if (prop.computed) throw new Error(`computed keys not allowed in ${path}`)
+        if (prop.kind !== 'init' || prop.method) throw new Error(`methods/accessors not allowed in ${path}`)
+        const key = propertyKey(prop.key, path)
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+          throw new Error(`reserved key name not allowed in ${path}: ${key}`)
         }
-        continue
+        out[key] = evaluateLiteral(prop.value, `${path}.${key}`)
       }
-      if (ch === '"' || ch === "'") {
-        i = skipQuoted(i, ch, end)
-        continue
+      return out
+    }
+    case 'ArrayExpression':
+      return node.elements.map((element, index) => {
+        if (!element) throw new Error(`sparse arrays not allowed in ${path}`)
+        if (element.type === 'SpreadElement') throw new Error(`spread not allowed in ${path}`)
+        return evaluateLiteral(element, `${path}[${index}]`)
+      })
+    case 'Literal':
+      return node.value
+    case 'TemplateLiteral':
+      if (node.expressions.length > 0) throw new Error(`template interpolation not allowed in ${path}`)
+      return node.quasis.map((quasi) => quasi.value.cooked ?? quasi.value.raw).join('')
+    case 'UnaryExpression':
+      if (node.operator === '-' && node.argument?.type === 'Literal' && typeof node.argument.value === 'number') {
+        return -node.argument.value
       }
-      if (ch === '`') {
-        i = copyTemplate(i + 1, end)
-        continue
+      throw new Error(`only negative-number unary allowed in ${path}`)
+    default:
+      throw new Error(`non-literal node type in ${path}: ${node.type} (meta must be a pure object literal)`)
+  }
+}
+
+function propertyKey(node, path) {
+  if (node.type === 'Identifier') return node.name
+  if (node.type === 'Literal' && (typeof node.value === 'string' || typeof node.value === 'number')) {
+    return String(node.value)
+  }
+  throw new Error(`unsupported key type in ${path}: ${node.type}`)
+}
+
+function validateMeta(meta) {
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) throw new Error('meta must be an object')
+  if (typeof meta.name !== 'string' || !meta.name.trim()) throw new Error('meta.name must be a non-empty string')
+  if (typeof meta.description !== 'string' || !meta.description.trim()) {
+    throw new Error('meta.description must be a non-empty string')
+  }
+  if (meta.whenToUse !== undefined && typeof meta.whenToUse !== 'string') {
+    throw new Error('meta.whenToUse must be a string')
+  }
+  if (meta.phases !== undefined) {
+    if (!Array.isArray(meta.phases)) throw new Error('meta.phases must be an array')
+    for (const phase of meta.phases) {
+      if (!phase || typeof phase !== 'object' || typeof phase.title !== 'string') {
+        throw new Error('each meta phase must have a title string')
       }
-
-      out[i] = ch
-      if (stopAtTemplateBrace && ch === '{') braceDepth++
-      else if (stopAtTemplateBrace && ch === '}') braceDepth--
-      i++
     }
-    return i
   }
-
-  function copyTemplate(start, end) {
-    let i = start
-    while (i < end) {
-      const ch = text[i]
-      const next = text[i + 1]
-      if (ch === '\\') {
-        i += 2
-        continue
-      }
-      if (ch === '`') return i + 1
-      if (ch === '$' && next === '{') {
-        const expressionEnd = copyCode(i + 2, end, true)
-        i = expressionEnd < end && text[expressionEnd] === '}' ? expressionEnd + 1 : expressionEnd
-        continue
-      }
-      i++
-    }
-    return i
-  }
-
-  copyCode(0, text.length)
-  return out.join('')
+  return meta
 }
 
-function collectCallExpressions(maskedText, names) {
-  const wanted = new Set(names)
-  const calls = []
-  const pattern = /\b([A-Za-z_$][\w$]*)\s*\(/g
-  let match
-  while ((match = pattern.exec(maskedText))) {
-    const callee = match[1]
-    if (!wanted.has(callee)) continue
-    let previous = match.index - 1
-    while (previous >= 0 && /\s/.test(maskedText[previous])) previous--
-    if (maskedText[previous] === '.') continue
-    const parenIndex = maskedText.indexOf('(', match.index + callee.length)
-    if (parenIndex < 0) continue
-    let end = parenIndex
-    try {
-      end = scanBalanced(maskedText, parenIndex)
-    } catch {
-      end = parenIndex
-    }
-    calls.push({ callee, start: match.index, parenIndex, end })
-    pattern.lastIndex = Math.max(pattern.lastIndex, parenIndex + 1)
+function objectExpressionStringProp(objNode, name) {
+  if (!objNode || objNode.type !== 'ObjectExpression') return { present: false, value: undefined }
+  for (const prop of objNode.properties) {
+    if (prop.type !== 'Property' || prop.computed) continue
+    let key
+    if (prop.key?.type === 'Identifier') key = prop.key.name
+    else if (prop.key?.type === 'Literal') key = String(prop.key.value)
+    if (key === name) return { present: true, value: staticStringOf(prop.value) }
   }
-  return calls
+  return { present: false, value: undefined }
 }
 
-function collectMethodCallExpressions(maskedText, methodName) {
-  const calls = []
-  const pattern = new RegExp(`\\.\\s*${methodName}\\s*\\(`, 'g')
-  let match
-  while ((match = pattern.exec(maskedText))) {
-    const parenIndex = maskedText.indexOf('(', match.index)
-    if (parenIndex < 0) continue
-    let end = parenIndex
-    try {
-      end = scanBalanced(maskedText, parenIndex)
-    } catch {
-      end = parenIndex
-    }
-    calls.push({ callee: methodName, start: match.index, parenIndex, end })
-    pattern.lastIndex = Math.max(pattern.lastIndex, parenIndex + 1)
-  }
-  return calls
-}
+const LOOP_TYPES = new Set([
+  'ForStatement',
+  'ForInStatement',
+  'ForOfStatement',
+  'WhileStatement',
+  'DoWhileStatement',
+])
 
-function collectLoopRanges(maskedText) {
-  const loops = []
-  const pattern = /\b(for|while)\s*\(/g
-  let match
-  while ((match = pattern.exec(maskedText))) {
-    const parenIndex = maskedText.indexOf('(', match.index + match[1].length)
-    if (parenIndex < 0) continue
-    let headerEnd = parenIndex
-    try {
-      headerEnd = scanBalanced(maskedText, parenIndex)
-    } catch {
-      headerEnd = parenIndex
-    }
-    let bodyStart = headerEnd + 1
-    while (bodyStart < maskedText.length && /\s/.test(maskedText[bodyStart])) bodyStart++
-    let end = bodyStart
-    if (maskedText[bodyStart] === '{') {
-      try {
-        end = scanBalanced(maskedText, bodyStart)
-      } catch {
-        end = bodyStart
-      }
-    } else {
-      while (end < maskedText.length && maskedText[end] !== ';' && maskedText[end] !== '\n') end++
-    }
-    loops.push({ type: match[1], start: match.index, headerEnd, bodyStart, end })
-    pattern.lastIndex = Math.max(pattern.lastIndex, headerEnd + 1)
-  }
-  return loops
-}
-
-function isInsideAnyRange(position, ranges) {
-  return ranges.some((range) => position >= range.start && position <= range.end)
-}
-
-function literalOptionValue(maskedSource, originalSource, optionName) {
-  const match = maskedSource.match(new RegExp(`\\b${optionName}\\s*:`))
-  if (!match) return null
-  let index = match.index + match[0].length
-  while (index < originalSource.length && /\s/.test(originalSource[index])) index++
-  const quote = originalSource[index]
-  if (quote !== '"' && quote !== "'") return null
-  let value = ''
-  for (let i = index + 1; i < originalSource.length; i++) {
-    const ch = originalSource[i]
-    if (ch === '\\') {
-      value += originalSource[i + 1] || ''
-      i++
-      continue
-    }
-    if (ch === quote) return value
-    value += ch
-  }
-  return null
-}
-
-function deterministicWarnings(maskedText) {
-  const warnings = []
-  if (/\bMath\s*\.\s*random\s*\(/.test(maskedText)) {
-    warnings.push('Math.random() is disabled in workflow scripts; vary prompts by index or args instead.')
-  }
-  if (/\bDate\s*\.\s*now\s*\(/.test(maskedText)) {
-    warnings.push('Date.now() is disabled in workflow scripts; pass timestamps via args.')
-  }
-  if (/\bnew\s+Date\s*\(\s*\)/.test(maskedText) || /(^|[^.\w$])Date\s*\(\s*\)/.test(maskedText)) {
-    warnings.push('Argless Date is disabled in workflow scripts; pass timestamps via args.')
-  }
-  return warnings
-}
-
+// Static preview, like the Pi tool's parser plus Claude Code's permission
+// preview. The AST walk fixes the old regex scanner's blind spots: agent()
+// calls inside nested template literals are now counted, and fan-out contexts
+// (loops, .map(), parallel(), pipeline()) mark the estimate as a lower bound.
 function inspectScript(text) {
-  const { meta } = extractWorkflow(text)
-  const withoutStrings = stripStringsAndComments(text)
-  const calls = collectCallExpressions(withoutStrings, ['agent', 'parallel', 'pipeline'])
-  const agents = calls.filter((call) => call.callee === 'agent')
-  const parallelCalls = calls.filter((call) => call.callee === 'parallel')
-  const pipelineCalls = calls.filter((call) => call.callee === 'pipeline')
-  const loops = collectLoopRanges(withoutStrings)
-  const mapCalls = collectMethodCallExpressions(withoutStrings, 'map')
-  const agentsWithAgentType = []
-  const agentsWithUnsupportedIsolation = []
+  const { meta, ast } = parseWorkflowScript(text)
+  let agentCalls = 0
+  let dynamicAgentCalls = 0
+  let parallelCalls = 0
+  let pipelineCalls = 0
+  let mapCalls = 0
+  let loopCalls = 0
+  let agentsWithAgentType = 0
   let agentsWithWorktreeIsolation = 0
+  const unsupportedIsolation = []
+  let hasReturn = false
 
-  for (const agentCall of agents) {
-    const source = withoutStrings.slice(agentCall.start, agentCall.end + 1)
-    const originalSource = text.slice(agentCall.start, agentCall.end + 1)
-    if (/\bagentType\s*:/.test(source)) agentsWithAgentType.push(agentCall.start)
-    const isolation = literalOptionValue(source, originalSource, 'isolation')
-    if (isolation === 'worktree') agentsWithWorktreeIsolation++
-    else if (isolation && isolation !== 'shared') agentsWithUnsupportedIsolation.push({ isolation, position: agentCall.start })
-  }
+  const walk = (node, inDynamic) => {
+    if (node.type === 'ReturnStatement') hasReturn = true
+    let opensDynamicScope = false
 
-  const agentsInLoops = agents.filter((call) => isInsideAnyRange(call.start, loops)).length
-  const agentsInParallel = agents.filter((call) => isInsideAnyRange(call.start, parallelCalls)).length
-  const agentsInPipeline = agents.filter((call) => isInsideAnyRange(call.start, pipelineCalls)).length
-  const agentsInMap = agents.filter((call) => isInsideAnyRange(call.start, mapCalls)).length
-  const dynamicAgentCalls = new Set()
-  for (const call of agents) {
-    if (
-      isInsideAnyRange(call.start, loops) ||
-      isInsideAnyRange(call.start, parallelCalls) ||
-      isInsideAnyRange(call.start, pipelineCalls) ||
-      isInsideAnyRange(call.start, mapCalls)
-    ) {
-      dynamicAgentCalls.add(call.start)
+    if (LOOP_TYPES.has(node.type)) {
+      loopCalls++
+      opensDynamicScope = true
     }
+
+    if (node.type === 'CallExpression') {
+      const callee = node.callee
+      if (callee?.type === 'Identifier' && callee.name === 'agent') {
+        agentCalls++
+        if (inDynamic) dynamicAgentCalls++
+        const opts = node.arguments?.[1]
+        if (objectExpressionStringProp(opts, 'agentType').present) agentsWithAgentType++
+        const isolation = objectExpressionStringProp(opts, 'isolation')
+        if (isolation.present) {
+          if (isolation.value === 'worktree') agentsWithWorktreeIsolation++
+          else if (isolation.value && isolation.value !== 'shared') unsupportedIsolation.push(isolation.value)
+        }
+      } else if (callee?.type === 'Identifier' && callee.name === 'parallel') {
+        parallelCalls++
+        opensDynamicScope = true
+      } else if (callee?.type === 'Identifier' && callee.name === 'pipeline') {
+        pipelineCalls++
+        opensDynamicScope = true
+      } else if (callee?.type === 'MemberExpression' && propertyNameOf(callee) === 'map') {
+        mapCalls++
+        opensDynamicScope = true
+      }
+    }
+
+    const childDynamic = inDynamic || opensDynamicScope
+    for (const child of astChildren(node)) walk(child, childDynamic)
   }
-  const agentCount = agents.length
-  const parallelCount = parallelCalls.length
-  const pipelineCount = pipelineCalls.length
-  const loopCount = loops.length
+  walk(ast, false)
+
   const warnings = [
-    ...deterministicWarnings(withoutStrings),
-    ...agentsWithAgentType.map(() => 'agentType is not supported by this runner and will fail fast at runtime.'),
-    ...agentsWithUnsupportedIsolation.map(({ isolation }) => `Unsupported agent isolation mode detected statically: ${isolation}`),
+    ...collectDeterminismWarnings(ast),
+    ...Array.from({ length: agentsWithAgentType }, () =>
+      'agentType is not supported by this runner and will fail fast at runtime.'),
+    ...unsupportedIsolation.map((isolation) => `Unsupported agent isolation mode detected statically: ${isolation}`),
   ]
-  const phases = Array.isArray(meta.phases) ? meta.phases : []
-  const estimatedAgents = dynamicAgentCalls.size > 0 ? Math.max(agentCount + dynamicAgentCalls.size * 2, agentCount) : agentCount
+  const estimatedAgents = dynamicAgentCalls > 0
+    ? Math.max(agentCalls + dynamicAgentCalls * 2, agentCalls)
+    : agentCalls
+
   return {
     meta,
-    phases,
+    phases: Array.isArray(meta.phases) ? meta.phases : [],
     scan: {
-      agentCalls: agentCount,
-      parallelCalls: parallelCount,
-      pipelineCalls: pipelineCount,
-      loopCalls: loopCount,
-      mapCalls: mapCalls.length,
-      agentsInLoops,
-      agentsInParallel,
-      agentsInPipeline,
-      agentsInMap,
-      agentsWithAgentType: agentsWithAgentType.length,
+      agentCalls,
+      parallelCalls,
+      pipelineCalls,
+      loopCalls,
+      mapCalls,
+      dynamicAgentCalls,
+      agentsWithAgentType,
       agentsWithWorktreeIsolation,
-      unsupportedIsolationCalls: agentsWithUnsupportedIsolation.length,
+      unsupportedIsolationCalls: unsupportedIsolation.length,
       estimatedAgents,
-      hasReturn: /\breturn\b/.test(withoutStrings),
+      hasReturn,
       warnings,
     },
   }
-}
-
-function stripStringsAndComments(text) {
-  return maskNonCode(text)
 }
 
 class Semaphore {
@@ -986,7 +825,7 @@ function createCachePathHelpers() {
   }
 }
 
-function runWorkflowBodyInWorker({ scriptPath, scriptBody, args, budgetTokens, agent, phase, log, workflow }) {
+function runWorkflowBodyInWorker({ scriptPath, scriptBody, args, budgetTokens, cwd, agent, phase, log, workflow }) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL(import.meta.url), {
       workerData: {
@@ -995,6 +834,7 @@ function runWorkflowBodyInWorker({ scriptPath, scriptBody, args, budgetTokens, a
         scriptBody,
         args,
         budgetTokens,
+        cwd,
       },
     })
     let settled = false
@@ -1166,6 +1006,7 @@ async function runWorkflowVmWorker() {
     log,
     workflow,
     args: workerData.args,
+    cwd: workerData.cwd,
     budget,
     enterCachePath: cachePaths.enterCachePath,
     getCachePath: cachePaths.getCachePath,
@@ -1180,7 +1021,7 @@ async function runWorkflowVmWorker() {
 async function executeWorkflow(input) {
   const scriptPath = path.resolve(input.scriptPath)
   const originalScript = await fs.readFile(scriptPath, 'utf8')
-  const { meta, scriptBody } = extractWorkflow(originalScript)
+  const { meta, scriptBody } = parseWorkflowScript(originalScript)
   const runId = input.runId || makeRunId()
   const taskId = input.taskId || makeTaskId()
   const outRoot = path.resolve(input.outRoot || DEFAULT_OUT)
@@ -1206,6 +1047,7 @@ async function executeWorkflow(input) {
     taskId,
     workflowName: meta.name,
     summary: meta.description,
+    ...(meta.whenToUse ? { whenToUse: meta.whenToUse } : {}),
     script: originalScript,
     scriptPath: scriptCopy,
     status: 'running',
@@ -1299,6 +1141,12 @@ async function executeWorkflow(input) {
   function validateAgentOptions(opts = {}) {
     if (opts.agentType !== undefined) {
       throw new Error('agentType is not supported by this runner; configure child prompts/models explicitly instead')
+    }
+    if (opts.tools !== undefined) {
+      throw new Error('per-agent tools are not supported by this runner; child codex exec processes use Codex\'s own tool surface')
+    }
+    if (opts.instructions !== undefined) {
+      throw new Error('per-agent instructions are not supported by this runner; put guidance directly in the agent() prompt')
     }
     if (opts.isolation === undefined || opts.isolation === 'shared') return
     if (opts.isolation === 'worktree') return
@@ -1428,7 +1276,7 @@ async function executeWorkflow(input) {
           result = mockResult(opts.schema, prompt, label)
         } else if (opts.isolation === 'worktree') {
           const response = await runWorktreeChildCodex({
-            prompt,
+            prompt: buildChildPrompt(prompt, { schema: opts.schema, label, phase: requestedPhaseTitle }),
             schema: opts.schema,
             agentId: progress.agentId,
             subagentDir,
@@ -1444,7 +1292,7 @@ async function executeWorkflow(input) {
           progress.worktree = worktree
         } else {
           result = await runChildCodex({
-            prompt,
+            prompt: buildChildPrompt(prompt, { schema: opts.schema, label, phase: requestedPhaseTitle }),
             schema: opts.schema,
             agentId: progress.agentId,
             subagentDir,
@@ -1571,6 +1419,7 @@ async function executeWorkflow(input) {
       scriptBody,
       args: input.args,
       budgetTokens: budget.total,
+      cwd: input.workspace,
       agent: { call: agent, spentTokens: () => spentTokens },
       phase,
       log,
@@ -1657,6 +1506,7 @@ function makeVmContext(bindings) {
     __hostNextPathOrdinal: hostNextPathOrdinal,
     __workflowArgsJson: JSON.stringify({ value: bindings.args }),
     __budgetTotal: bindings.budget.total,
+    __workflowCwd: typeof bindings.cwd === 'string' ? bindings.cwd : '',
   }, {
     codeGeneration: { strings: false, wasm: false },
   })
@@ -1789,13 +1639,15 @@ function makeVmContext(bindings) {
     configurable: false,
   })
 
+  const cwdValue = String(__workflowCwd || '')
+  define('cwd', cwdValue)
   define('console', Object.freeze({ log: (message) => callHost('log', encodePayload([String(message)])) }))
   define('structuredClone', (value) => clonePlain(value))
   define('setTimeout', undefined)
   define('setInterval', undefined)
   define('Intl', undefined)
   define('require', undefined)
-  define('process', undefined)
+  define('process', Object.freeze({ cwd: () => cwdValue }))
   define('constructor', undefined)
   Object.defineProperty(globalThis, '__proto__', {
     value: undefined,
@@ -1810,6 +1662,7 @@ function makeVmContext(bindings) {
   delete globalThis.__hostNextPathOrdinal
   delete globalThis.__workflowArgsJson
   delete globalThis.__budgetTotal
+  delete globalThis.__workflowCwd
   Object.setPrototypeOf(globalThis, null)
 })()
 `, context, { timeout: 1000 })
@@ -1969,9 +1822,7 @@ async function recordFailedWorktreeFinalization(worktree, subagentDir, agentId, 
 
 async function runWorktreeChildCodex(input) {
   const worktree = await createGitWorktree(input.workspace, input.agentId, [input.outRoot, input.runDir])
-  const prompt = `You are running inside an isolated git worktree for this workflow agent.
-Make any requested edits only in this worktree. The parent workspace will not receive these changes automatically; an integrator must inspect or apply the captured patch after this agent returns.
-If a structured output schema is provided, obey it exactly and include change/verification details in the schema fields where they fit.
+  const prompt = `Isolation: you are running inside a dedicated git worktree for this workflow agent. Make any file edits only here; the parent workspace does not receive them automatically — an integrator inspects or applies the captured patch after you return. Describe the edits and any verification you ran in your final output.
 
 ${input.prompt}`
   let result
@@ -2003,6 +1854,34 @@ ${input.prompt}`
     throw childError
   }
   return { result, worktree: worktreeInfo }
+}
+
+// Frame every child `codex exec` run as a workflow subagent whose final message
+// is consumed as a return value. This mirrors the Pi extension's structured
+// output contract (final action must be the machine-readable result, no trailing
+// prose) and Claude Code workflow agents being told their final text is a return
+// value, adapted to Codex's `--output-schema` mechanism.
+function buildChildPrompt(prompt, { schema, label, phase } = {}) {
+  const header =
+    'You are an isolated subagent in a Codex dynamic workflow run by a parent orchestrator. ' +
+    'Your final message is consumed programmatically as this subagent\'s return value: it is not shown to a human and there is no follow-up turn. Make it complete and self-contained.'
+  const context = []
+  if (label) context.push(`Task label: ${label}`)
+  if (phase) context.push(`Workflow phase: ${phase}`)
+  const contract = schema
+    ? [
+        'Output contract (structured):',
+        '- Do any needed reading or commands first, then end your turn with a final message that is a single JSON value satisfying the provided output schema.',
+        '- The final message must be raw JSON only: no prose, no Markdown, no code fences, nothing before or after it.',
+        '- Fill every required field with real, evidence-based values; do not invent data. Cite concrete file paths, symbols, commands, or line references in the relevant fields.',
+      ].join('\n')
+    : [
+        'Output contract (text):',
+        '- End your turn with a final message that fully answers the task; that message is the return value.',
+        '- Be concrete and self-contained: cite file paths, symbols, commands, or evidence rather than referring to context the parent cannot see.',
+        '- Do not ask the parent questions or defer work; complete the task with the information available.',
+      ].join('\n')
+  return [header, context.join('\n'), prompt, contract].filter((part) => part && part.trim()).join('\n\n')
 }
 
 async function runChildCodex({ prompt, schema, agentId, subagentDir, workspace, sandbox, codexBin, childModel, isolation = 'shared' }) {
@@ -2039,7 +1918,12 @@ async function runChildCodex({ prompt, schema, agentId, subagentDir, workspace, 
   }
   const finalText = await fs.readFile(finalPath, 'utf8')
   if (!schema) return finalText.trim()
-  return parseJsonOutput(finalText)
+  const parsed = parseJsonOutput(finalText)
+  const violations = validateAgainstSchema(parsed, schema, 'result')
+  if (violations.length) {
+    throw new Error(`Structured child output did not satisfy the schema: ${violations.slice(0, 5).join('; ')}`)
+  }
+  return parsed
 }
 
 function spawnCapture(command, args, stdin) {
@@ -2070,6 +1954,75 @@ function parseJsonOutput(text) {
     if (first >= 0 && last > first) return JSON.parse(text.slice(first, last + 1))
     throw new Error(`Structured child output was not JSON: ${text.slice(0, 500)}`)
   }
+}
+
+// Lightweight JSON Schema validator for the subset workflow schemas use
+// (type, enum, const, required, properties, additionalProperties:false, items).
+// The Pi extension validates structured output with TypeBox before the parent
+// receives it; child `codex exec --output-schema` only guides the model, so the
+// runner validates the parsed object here and fails the agent on a mismatch,
+// instead of silently propagating wrong-shaped data into synthesis.
+function jsonSchemaType(value) {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  if (Number.isInteger(value)) return 'integer'
+  return typeof value
+}
+
+function matchesSchemaType(value, type) {
+  const actual = jsonSchemaType(value)
+  if (type === 'number') return actual === 'number' || actual === 'integer'
+  if (type === 'integer') return actual === 'integer'
+  return actual === type
+}
+
+function validateAgainstSchema(value, schema, path = 'result') {
+  const errors = []
+  if (!schema || typeof schema !== 'object') return errors
+
+  if (schema.enum !== undefined) {
+    const stable = stableJson(value)
+    if (!schema.enum.some((option) => stableJson(option) === stable)) {
+      errors.push(`${path} must be one of ${JSON.stringify(schema.enum)}`)
+      return errors
+    }
+  }
+  if (schema.const !== undefined && stableJson(value) !== stableJson(schema.const)) {
+    errors.push(`${path} must equal ${JSON.stringify(schema.const)}`)
+    return errors
+  }
+
+  const types = schema.type === undefined ? [] : Array.isArray(schema.type) ? schema.type : [schema.type]
+  if (types.length && !types.some((type) => matchesSchemaType(value, type))) {
+    errors.push(`${path} must be of type ${types.join('|')}, got ${jsonSchemaType(value)}`)
+    return errors
+  }
+
+  const effectiveType = types.find((type) => matchesSchemaType(value, type))
+    || (schema.properties ? 'object' : schema.items ? 'array' : undefined)
+
+  if (effectiveType === 'object' && value && typeof value === 'object' && !Array.isArray(value)) {
+    for (const key of schema.required || []) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) errors.push(`${path}.${key} is required`)
+    }
+    if (schema.additionalProperties === false && schema.properties) {
+      for (const key of Object.keys(value)) {
+        if (!Object.prototype.hasOwnProperty.call(schema.properties, key)) {
+          errors.push(`${path}.${key} is not an allowed property`)
+        }
+      }
+    }
+    for (const [key, propSchema] of Object.entries(schema.properties || {})) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        errors.push(...validateAgainstSchema(value[key], propSchema, `${path}.${key}`))
+      }
+    }
+  } else if (effectiveType === 'array' && Array.isArray(value) && schema.items && !Array.isArray(schema.items)) {
+    value.forEach((item, index) => {
+      errors.push(...validateAgainstSchema(item, schema.items, `${path}[${index}]`))
+    })
+  }
+  return errors
 }
 
 function mockResult(schema, prompt, label) {
@@ -2206,6 +2159,10 @@ async function main() {
       ? await readArgs(opts)
       : (resumeSnapshot && Object.prototype.hasOwnProperty.call(resumeSnapshot, 'args') ? resumeSnapshot.args : undefined)
     const sandbox = opts.sandbox || resumeSnapshot?.sandbox || 'read-only'
+    const allowedSandboxes = new Set(['read-only', 'workspace-write', 'danger-full-access'])
+    if (!allowedSandboxes.has(sandbox)) {
+      throw new Error(`--sandbox must be one of read-only, workspace-write, danger-full-access (got: ${sandbox})`)
+    }
     const childModel = opts['child-model'] || resumeSnapshot?.childModel
     const resumeAgentLimit = resumeSnapshot?.agentLimit
     const hasPersistedAgentUsage = resumeDir && Number.isInteger(resumeAgentLimit?.used)
@@ -2244,11 +2201,16 @@ async function main() {
   throw new Error(`Unknown command: ${command}`)
 }
 
+// Exported for unit tests; importing the module must not run the CLI.
+export { parseWorkflowScript, inspectScript, buildChildPrompt, evaluateLiteral, validateMeta, validateAgainstSchema }
+
+const invokedDirectly = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+
 if (!isMainThread && workerData?.mode === 'workflow-vm') {
   runWorkflowVmWorker().catch((error) => {
     parentPort.postMessage({ type: 'error', error: serializeError(error) })
   })
-} else {
+} else if (invokedDirectly) {
   main().catch((error) => {
     process.stderr.write(`${error.stack || error.message}\n`)
     process.exitCode = 1
