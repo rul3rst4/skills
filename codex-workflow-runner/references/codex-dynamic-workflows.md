@@ -1,18 +1,23 @@
-# Claude Dynamic Workflows Reference
+# Codex Dynamic Workflows Reference
 
-This reference records observable behavior from local Claude Code 2.1.158 artifacts and the captured tool contract. It is a clean-room compatibility guide, not a claim about Anthropic internals.
+This reference documents the workflow script contract, the local snapshot and journal schema, and the static-inspection behavior of this Codex runner. The runner is a Codex-native adaptation of [`earendil-works/pi-dynamic-workflows`](https://github.com/Michaelliv/pi-dynamic-workflows) (a Pi extension that runs subagents as in-memory sessions), which is itself a clean-room take on Anthropic's dynamic workflows in Claude Code. It is a compatibility and design guide, not a claim about Pi or Anthropic internals.
+
+The defining adjustment for Codex: where the Pi extension spawns in-memory subagent sessions inside one process, this runner delegates each `agent()` to a child `codex exec` process (`--output-schema` for structured output, `--sandbox`, `-C`, `--model`, `--json`, `--output-last-message`). On top of the shared DSL it adds persisted snapshots, an append-only journal, resume, worktree isolation, one-level `workflow()` composition, and a static `inspect` preview.
 
 ## Public Script Contract
 
-Workflow scripts are plain JavaScript. They begin with:
+Workflow scripts are plain JavaScript, parsed with a vendored [acorn](../scripts/vendor/acorn.mjs) AST parser. The first statement must be a literal `export const meta = {...}`:
 
 ```js
 export const meta = {
   name: 'workflow-name',
   description: 'One-line description',
+  whenToUse: 'Optional: when this workflow is the right tool',
   phases: [{ title: 'Scan', detail: 'optional detail' }],
 }
 ```
+
+`meta.name` and `meta.description` are required non-empty strings; `whenToUse` and `phases` are optional. The literal is evaluated from the AST, so spreads, computed keys, function calls, and template interpolation are rejected inside `meta`.
 
 The body runs in an async context and can use:
 
@@ -23,26 +28,28 @@ The body runs in an async context and can use:
 - `log(message)`
 - `workflow(nameOrRef, args)`
 - `args`
+- `cwd` / `process.cwd()` — the workspace directory (`process` is a frozen shim exposing only `cwd()`)
 - `budget`
 
-Observed restrictions: no TypeScript syntax, no Node filesystem APIs, no argless `new Date()`, no `Date.now()`, and no `Math.random()`.
+Restrictions: no TypeScript syntax, no Node filesystem APIs, no timers, no argless `new Date()`, no `Date.now()`, and no `Math.random()`. `new Date(timestamp)` with an explicit argument is allowed; pass the current time through `args` when needed.
 
 ## Agent Semantics
 
-`agent(prompt, opts)` spawns a child agent. Observed options:
+`agent(prompt, opts)` spawns a child `codex exec` process. Supported options:
 
 ```js
 {
-  label: 'display label',
-  phase: 'progress phase title',
-  schema: { type: 'object', ... },
-  model: 'model override',
-  isolation: 'worktree',
-  agentType: 'custom agent type'
+  label: 'display label',       // short label for progress, journals, and errors
+  phase: 'progress phase title',// overrides the current phase for this agent
+  schema: { type: 'object', ... }, // JSON Schema -> codex exec --output-schema
+  model: 'model override',      // -> codex exec --model
+  isolation: 'worktree',        // run in a temporary git worktree, capture a patch
 }
 ```
 
-Without `schema`, the return value is final text. With `schema`, the child is forced through structured output and the parent receives a validated object.
+Without `schema`, the return value is the child's final message text. With `schema`, the child is run with `--output-schema` and the parent receives the object parsed from its final message. Because `--output-schema` only guides the model (it does not hard-enforce the shape), the runner validates the parsed object against the schema (`validateAgainstSchema`: type, `enum`/`const`, `required`, `additionalProperties:false`, nested `properties`/`items`) and fails the agent if it does not conform, rather than propagating wrong-shaped data — restoring the validation guarantee the Pi extension gets from its TypeBox-backed `structured_output` tool. The runner frames every child so its final message is treated as the return value (no human-facing prose; for schema agents, raw JSON only).
+
+`agentType` is part of the upstream DSL but is **not supported** here: the Pi/Claude versions map it to custom subagent profiles, which have no Codex equivalent yet, so the runner fails fast rather than silently running a generic child. `isolation: "worktree"` is patch-based (see below), not an automatic merge.
 
 ## Parallel Versus Pipeline
 
@@ -96,10 +103,10 @@ The named loops are reusable consequences of these choices, not a hardcoded menu
 
 ## Local Snapshot Shape
 
-Observed Claude workflow snapshots live under:
+Each run writes a snapshot under the workspace:
 
 ```text
-~/.claude/projects/<project>/<session>/workflows/wf_<id>.json
+.codex-workflows/<runId>/workflow.json
 ```
 
 Useful keys:
@@ -109,6 +116,7 @@ runId
 taskId
 workflowName
 summary
+whenToUse        (only when meta.whenToUse is set)
 script
 scriptPath
 status
@@ -141,36 +149,32 @@ workflow_agent:
 
 ## Journal Shape
 
-Observed journals live under:
+Each run appends a journal under:
 
 ```text
-~/.claude/projects/<project>/<session>/subagents/workflows/<runId>/journal.jsonl
+.codex-workflows/<runId>/subagents/workflows/<runId>/journal.jsonl
 ```
 
-Observed events:
+Events:
 
 ```json
 {"type":"started","key":"v2:<64 hex>","agentId":"..."}
 {"type":"result","key":"v2:<64 hex>","agentId":"...","result":{...}}
 ```
 
-The `v2:` key is consistent with hashing a normalized `agent()` call identity. A compatible runner should hash at least prompt and normalized options, including schema, label, phase, model, and agent type.
-For deterministic resume, include the invocation position or another stable call-order component too; otherwise repeated identical prompts in loops or fan-out stages collapse to one cache entry.
+The `v2:` key hashes a normalized `agent()` call identity: prompt, normalized options (schema, label, phase, model, isolation), workspace, mock flag, and a stable call-path that encodes the invocation position. The call-path component keeps repeated identical prompts in loops or fan-out stages from collapsing to one cache entry, so resume is deterministic. Cached results are only replayed when the run is `--sandbox read-only`; mutating runs always re-run.
 
 Current Codex runner note: `agentType` is intentionally rejected at runtime until Codex can map it to real child-agent profiles. `isolation: "worktree"` requires the parent git worktree to be clean outside the runner's own output directory, then runs the child in a temporary worktree, captures a patch/status artifact, keeps changed worktrees for integrator review, and removes unchanged worktrees.
 
-## Permission Preview
+## Static Inspect (Permission Preview)
 
-The Claude Code binary exposes strings indicating a static script preview:
+The `inspect` command is a static preview, analogous to Claude Code's permission preview and a stronger version of what the Pi tool surfaces before running a script. It parses the script with acorn and walks the AST to:
 
-- Detects `agent(...)`, `parallel(...)`, `for`, and `while`.
-- Groups calls as sequential, parallel, or loop.
-- Extracts prompt previews.
-- Estimates agent count.
-- Lets the user view workflow summary, view raw script, and edit the script in `$EDITOR`.
+- Count `agent()`, `parallel()`, `pipeline()`, `map()`, and loops.
+- Flag `agent()` calls nested inside loops, `map()`, `parallel()`, or `pipeline()` as dynamic fan-out, so `estimatedAgents` is reported as a lower bound.
+- Flag determinism violations (`Date.now()`, `Math.random()`, argless `new Date()`) and unsupported `agentType`/`isolation` usage before execution.
 
-The bundled runner implements a lightweight `inspect` command for the same purpose.
-Its estimate is static and intentionally conservative: mapped arrays, dynamic verifier fan-out, and data-dependent loops should be confirmed from the executed `workflow.json.agentCount`. The inspector also flags deterministic violations and unsupported `agentType` usage before execution.
+Because it is AST-based rather than regex-based, it correctly counts `agent()` calls hidden inside nested template literals — a case the previous string-scanning inspector missed (it reported `agentCalls: 0` for pipelines whose stage prompts used backtick-nested code fences). The authoritative count is always `workflow.json.agentCount` after a run.
 
 ## Codex Nesting Caveat
 
@@ -182,14 +186,14 @@ Running this runner from a top-level Codex session can spawn child `codex exec` 
 
 ## Compatibility Gaps
 
-The clean-room runner intentionally does not replicate:
+This runner intentionally does not replicate:
 
-- Claude Code terminal UI.
-- Anthropic private subagent prompts.
-- Custom `agentType` behavior.
+- The Pi/Claude Code terminal UI or live `/workflows` progress view.
+- Pi in-memory subagent sessions (it shells out to `codex exec` per agent instead).
+- Custom `agentType`/subagent-profile behavior.
 - Cloud-hosted workflow execution.
-- Automatic merge/apply of worktree-isolated agent patches.
-- Exact token accounting.
-- Named built-in workflow registry.
+- Automatic merge/apply of worktree-isolated agent patches (patches are captured for an integrator).
+- Exact token accounting (budget uses an approximate char/4 estimate).
+- A named built-in workflow registry (`workflow()` resolves by script path only).
 
-It does implement the reusable contract needed for Codex-native experimentation: JS orchestration, child Codex delegation, schema-shaped outputs, snapshot persistence, journal replay, progress records, static inspection, and resume from cached agent calls.
+It does implement the reusable contract needed for Codex-native orchestration: AST-validated JS scripts, child `codex exec` delegation, schema-shaped outputs via `--output-schema`, snapshot persistence, journal replay/resume, progress records, worktree isolation, one-level `workflow()` composition, a lifetime agent cap, and static inspection.

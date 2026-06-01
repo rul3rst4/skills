@@ -7,6 +7,8 @@ description: Execute and inspect Codex dynamic workflows. Use when the user asks
 
 Run Codex dynamic workflows. Prefer native Codex thread orchestration when it is available in the current Codex app session; use the bundled clean-room JavaScript runtime when the workflow needs to be portable, repeatable from a terminal, resumable from runner journals, or executed outside Codex Desktop.
 
+The portable runtime is a Codex-native adaptation of [`earendil-works/pi-dynamic-workflows`](https://github.com/Michaelliv/pi-dynamic-workflows) (a Pi extension that fans work out to in-memory subagents), which is itself inspired by Anthropic's dynamic workflows in Claude Code. It keeps the same deterministic, AST-validated script contract — `export const meta = {...}` followed by plain JS calling `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`, and `workflow()` — but delegates each `agent()` to a child `codex exec` process instead of an in-process session, and adds journals, resume, snapshots, worktree isolation, and a static `inspect` preview on top.
+
 ## Mode Selection
 
 Choose the execution mode before authoring a workflow:
@@ -138,16 +140,17 @@ RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.
 node "$RUNNER" run --resume .codex-workflows/wf_abc123def456
 ```
 
-Completed `agent()` calls with the same prompt and normalized options are returned from the journal cache.
+Completed `agent()` calls with the same prompt and normalized options are returned from the journal cache when the run is `--sandbox read-only`; mutating-sandbox runs always re-run their agents.
 
 ## Workflow Script Contract
 
-Write plain JavaScript, not TypeScript. Begin with a pure literal `meta` block:
+Write plain JavaScript, not TypeScript. The script is parsed with a bundled [acorn](scripts/vendor/acorn.mjs) AST parser, so the first statement must be a literal `export const meta = {...}` (no spreads, computed keys, calls, or template interpolation inside `meta`). `name` and `description` are required; `whenToUse` and `phases` are optional. Begin with the `meta` block:
 
 ```js
 export const meta = {
   name: 'review-changes',
   description: 'Review changed files and verify findings',
+  whenToUse: 'Reviewing a diff across several independent dimensions',
   phases: [
     { title: 'Review', detail: 'dimension readers' },
     { title: 'Verify', detail: 'skeptical checks' },
@@ -177,9 +180,23 @@ Runtime globals:
 - `log(message)`: append a run log.
 - `workflow(ref, args)`: run one child workflow by `{scriptPath}` or direct script path. Nesting is limited to one level.
 - `args`: parsed JSON value from `--args` or `--args-file`.
+- `cwd` / `process.cwd()`: the workspace directory child agents run in (the `--workspace` value). `process` is a frozen shim that exposes only `cwd()`.
 - `budget`: exposes `total`, `spent()`, and `remaining()` using approximate token accounting.
 
-The VM blocks `Date.now()`, argless `new Date()`, `Math.random()`, `require`, `process`, and filesystem APIs inside workflow scripts. Pass timestamps through `args`.
+The VM blocks `Date.now()`, argless `new Date()`, `Math.random()`, `require`, filesystem APIs, and timers inside workflow scripts. Pass timestamps through `args`. `new Date(timestamp)` with an explicit argument is allowed, so thread the current time through `args` when a script needs it.
+
+### Authoring rules
+
+These mirror the Pi extension's tool guidelines, adapted for the Codex runner:
+
+- Every workflow must call `agent()` at least once. Do not use a workflow only to declare phases or return a static object.
+- Give each `agent()` a unique short `label` (2-5 words). Unique labels keep live status, journals, and error reporting readable.
+- `parallel()` takes functions, not promises: `await parallel(items.map(item => () => agent(...)))`, never `await parallel(items.map(item => agent(...)))`. Results come back in input order.
+- `pipeline(items, ...stages)` runs each item through stages while different items advance concurrently. Each stage receives `(previousValue, originalItem, index)`.
+- Failed `agent()`, `parallel()`, or `pipeline()` branches resolve to `null` and log the failure (the run is not aborted). Check for `null` before synthesizing conclusions.
+- Pass machine-readable needs through `opts.schema` as a plain JSON Schema (not TypeScript/TypeBox). The child returns the validated object via `codex exec --output-schema`.
+- Child agents do not share the parent's context. Put all needed task context, relevant paths, and the expected output shape in each `agent()` prompt; the runner additionally frames every child so its final message is treated as the return value.
+- Include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value rather than pasting child outputs together.
 
 ## Execution Modes
 
@@ -203,9 +220,11 @@ node "$RUNNER" run workflow.js --mock-agent
 
 Use `--json` when another tool needs machine-readable output.
 
-## Reverse-Engineered Notes
+## Reference Notes
 
-Read [references/codex-dynamic-workflows.md](references/codex-dynamic-workflows.md) when implementing new features or comparing workflow runner behavior. It records the observed prompt contract, local snapshot schema, journal schema, permission-preview behavior, and known gaps.
+Read [references/codex-dynamic-workflows.md](references/codex-dynamic-workflows.md) when implementing new features or comparing runner behavior. It documents the script contract this runner shares with `pi-dynamic-workflows`, the local snapshot schema, the journal schema, the static `inspect` behavior, and the Codex-specific adjustments and known gaps. [references/codex-workflow-runner-parity-analysis.md](references/codex-workflow-runner-parity-analysis.md) compares this runner against `pi-dynamic-workflows` and Claude Code workflows.
+
+Parser and inspection logic have unit tests under `tests/`. Run them with `node --test tests/parser.test.mjs` from the skill directory.
 
 ## Validation Checklist
 
