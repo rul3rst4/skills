@@ -1,183 +1,209 @@
 ---
 name: codex-workflow-runner
-description: Execute and inspect Codex dynamic workflow scripts. Use when the user asks to run, prototype, reverse-engineer, validate, resume, or build a self-made version of Codex dynamic workflows with phases, agent fan-out, pipeline/parallel orchestration, schema-shaped child outputs, journals, and child Codex delegation.
+description: Author, run, and orchestrate multi-agent Codex workflows — deterministic JavaScript scripts that fan work out to child Codex agents with phases, pipeline/parallel fan-out, schema-shaped outputs, bounded loops, journals, and parent synthesis. Use when a task needs broad parallel coverage, independent verification before acting, or more scale than one context can hold: audits, reviews, research sweeps, migrations, large refactors, throughput work, or any "spawn N agents and reconcile their findings" task. Triggers on "use $codex-workflow-runner", "run/author a workflow", "fan out agents", or "orchestrate this with subagents".
 ---
 
 # Codex Workflow Runner
 
-Run Codex dynamic workflow scripts with a bundled clean-room runtime. Use this for deterministic multi-agent orchestration where a parent Codex instance should author or execute JavaScript workflow scripts that call `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`, and `workflow()`.
+You (the parent Codex session) are the **orchestrator**. A workflow is a plain-JavaScript script you write that fans work out to child `codex exec` agents *deterministically*, collects their structured results, and hands them back to you to synthesize. The bundled runtime gives you the same primitives Claude Code's Workflow tool exposes — `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`, `workflow()`, schemas, budgets, journals — running against real child Codex processes.
 
-## Orchestrator Mode
+Reach for a workflow to be **comprehensive** (decompose a problem and cover it in parallel), to be **confident** (independent perspectives and adversarial checks before you commit to a conclusion or an edit), or to take on **scale one context can't hold** (sweeps, migrations, audits across many files). The script is where you encode that structure: what fans out, what verifies, what synthesizes, and what gates progress.
 
-When the user says "Use `$codex-workflow-runner` to create/run a workflow", the main Codex instance is the orchestrator. Do not wait for the user to provide `workflow.js` unless they explicitly want to write it themselves.
+Do **not** reach for a workflow for a single-file edit, a one-shot question, or work you can finish faster inline. Orchestration has real cost (one child process per `agent()`); spend it only when parallel coverage, independent verification, or scale actually pays for itself.
 
-Default loop:
+## The operating loop
 
-1. Infer the target workspace/app from the current directory and prompt. Ask only if the app/scope cannot be discovered or if the next step would be risky.
-2. Inspect the repo enough to pick lenses, success criteria, risk gates, and verification commands.
-3. Author a local `workflow.js` under `.codex-workflows/authored/` using the script contract below. Prefer the `template throughput` command as a starting point for throughput work, then customize it to the repo.
-4. Run `inspect` on the authored script and check the phase/agent estimate.
-5. Run the workflow with child Codex agents. Use `read-only` for assessment/review workflows and `workspace-write` only for narrow implementation workers the user requested or approved.
-6. Inspect `workflow.json` and `journal.jsonl`. Reject malformed, uncited, or unverified child outputs.
-7. Synthesize the result in the parent. If the goal requires code changes, implement the accepted changes yourself or author a second narrow fix workflow, then run verification.
+When the user says "use `$codex-workflow-runner`" (or asks you to author/run a workflow), **you** drive the whole loop. Author the script proactively — do not wait for the user to hand you `workflow.js` unless they want to write it themselves.
 
-Before authoring, derive the loop from the task mechanics. Codex workflows are not a fixed list of phase names; they are control loops that transform uncertainty into verified state changes. Build the loop by answering:
+1. **Scope it.** Infer the target repo/app from the cwd and prompt. Ask only if scope is genuinely undiscoverable or the next step is risky/irreversible.
+2. **Scout inline first, then fan out (hybrid).** You rarely know the work-list before the task. Discover it cheaply yourself — list the files, find the routes, scope the diff, identify the lenses — *then* author a workflow that pipelines over that list. Don't fan out blind.
+3. **Author** a `workflow.js` (default location `.codex-workflows/authored/`) using the contract below. Pick lenses, schemas, verifiers, and a stop condition that match the task's *mechanics*, not a template name.
+4. **`inspect`** the script. Confirm it parses, read the phase/agent estimate, and clear any determinism/`agentType`/isolation warnings before spending money.
+5. **`run`** it. Use `--sandbox read-only` for any assessment/review/research workflow (it is the default, and the only mode that caches and resumes). Use `--sandbox workspace-write` only for narrow implementer agents the user approved.
+6. **Verify the outputs.** Read `workflow.json` and `journal.jsonl`. Confirm `status: completed`. Parse the structured `result` and per-agent records. Reject uncited, malformed, or unverified child output — do not paste it through.
+7. **Synthesize in the parent.** Produce the answer yourself from verified evidence. If the goal needs code changes, implement the accepted changes yourself or author a second, narrow `Fix → Verify` workflow, then run the verification commands.
 
-1. What is the unit of work: file, crate, route, command, finding, failing test, dependency tier, design option, or duplicate cluster?
-2. What is the source of truth: static code, docs/specs, compiler, tests, runtime probes, benchmark numbers, user acceptance, or cross-agent vote?
-3. What can run independently: read-only discovery, file-disjoint edits, command probes, per-item classification, or verifier votes?
-4. What must be serialized: shared-tree mutation, global build/test/git, final architecture decisions, cross-shard clustering, or integration?
-5. What is the gate: all items classified, no confirmed findings, build green, tests pass, probe commands pass, benchmark improves, no blockers, or max rounds reached?
-6. What does failure look like: low confidence, disputed votes, blocked dependency, compile error, panic signature, duplicate cluster rejected, or regression?
-
-Then compose phases from the necessary control primitives:
-
-- Fan out for independent read-only exploration or disjoint edit packets.
-- Fan in to dedupe, cluster, judge, rank, or synthesize before spending mutation budget.
-- Refute with independent verifiers when false positives are expensive.
-- Vote and tiebreak when judgments are subjective or noisy.
-- Serialize mutation when agents share files, build products, git state, or a global dependency graph.
-- Probe with executable commands when the system itself can reveal the next failure.
-- Repeat only around an external gate, with `MAX_ROUNDS`, success predicate, and blocked return shape encoded in the script.
-
-Named shapes are examples of this derivation, not presets:
-
-- `Classify -> Sample Verify -> Synthesize`: unit is many items; truth is taxonomy evidence; gate is acceptable unknown/error rate.
-- `Panel -> Judge -> Foundation -> Docs`: unit is design option; truth is architectural constraints; gate is one coherent decision.
-- `Assess -> Sequential Implement -> Parallel Verify -> Gate -> Report`: unit is subsystem; truth is code plus build/test; mutation is serialized.
-- `Shared Infra -> Parallel Modules -> Integrate`: unit is module; shared contracts come first; one integrator owns final consistency.
-- `Ungate/Port -> Multi-Vote Verify -> Fix`: unit is tier/module; truth is source parity plus compiler; repeated until dependencies unblock.
-- `Probe -> Dedup Failures -> Fix -> Repeat`: unit is failing command/signature; truth is runtime output; repeated until probes pass.
-- `Shard Find -> CrossRef -> Multi-Vote Verify -> Apply -> Compile Gate`: unit is shard then cluster; truth is cross-reference plus votes; one final gate owns build/git.
-- `Fix -> Re-verify`: unit is confirmed finding; truth is regression test or source check.
-
-For any repeated loop, set explicit stop rules in the script: `MAX_ROUNDS`, success condition, max agents/candidates, and what to return when still blocked. Keep mutation phases serialized or file-disjoint; keep broad discovery phases parallel or pipelined. If the task shape changes mid-run, synthesize the new evidence and author the next loop rather than forcing the old loop to continue.
-
-For "increase throughput of the app" specifically, start with an assessment workflow unless the bottleneck and intended edit are already concrete. The usual shape is `Assess -> Verify -> Synthesize`, followed by parent integration or a targeted `Fix -> Verify` workflow. For throughput work with reproducible commands, `Probe -> Dedup Failures -> Fix -> Repeat` may be better than a pure assessment loop.
-
-Choose subagent count from scope:
-
-- Narrow known fix: 1 implementer + 1 verifier.
-- Small app or focused throughput problem: 2-3 assessors across the most relevant lenses, then verify the top findings.
-- Medium app throughput work: 4-6 assessors, usually runtime hot paths, data access, concurrency/I/O, frontend/delivery, observability/tests, plus a domain-specific lens.
-- Broad/high-risk audit: 6-10 assessors plus independent verification. Only exceed this when the repo/problem is genuinely large and the user accepts the cost.
-
-Use `pipeline()` when each item can advance independently. Use `parallel()` for true phase barriers such as "run all reviewers, then synthesize." Always include a synthesis agent for broad workflows; do not just paste child outputs together.
-
-`inspect` is a static preview. Treat `estimatedAgents` as a lower bound when `agent()` is inside `LENSES.map(...)`, `parallel(...)`, `pipeline(...)`, or data-dependent verification loops. The authoritative count is `workflow.json.agentCount` after execution.
-
-If a workflow is run from inside another sandboxed Codex child, nested `codex exec` may fail before model work with errors like `attempt to write a readonly database`, `failed to initialize in-process app-server client`, or disabled DNS/network. For real nested delegation, launch the outer Codex child with enough access for Codex state/app-server initialization, or run the workflow from the top-level Codex session. A mock run can still validate script mechanics, but it does not validate delegation.
-
-## Quick Start
-
-Use the bundled runtime directly. In a standard Codex skill install, set:
+## Running the runner
 
 ```bash
 RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs"
-node "$RUNNER" inspect path/to/workflow.js
-node "$RUNNER" run path/to/workflow.js --workspace "$PWD"
+# If the path differs (project-local install), locate it:
+# RUNNER="$(find "$HOME/.codex/skills" "$PWD/.codex" -name codex_workflow_runner.mjs 2>/dev/null | head -1)"
+
+node "$RUNNER" inspect .codex-workflows/authored/workflow.js          # static preview + warnings
+node "$RUNNER" run .codex-workflows/authored/workflow.js --workspace "$PWD"
+node "$RUNNER" summarize .codex-workflows/wf_<id>                      # quick status/result read
+node "$RUNNER" run --resume .codex-workflows/wf_<id>                   # resume from journal cache
 ```
 
-Create a throughput workflow starter:
+Key `run` flags: `--workspace <dir>` (child cwd), `--sandbox read-only|workspace-write` (default `read-only`), `--args <json>` / `--args-file <file>` (exposed as global `args`), `--child-model <model>`, `--max-concurrency <n>` (default `min(16, cpu-2)`), `--max-agents <n>` (lifetime cap, default 1000), `--budget-tokens <n>` (sets `budget.total`), `--mock-agent` (mechanics only — no real model), `--json` (machine-readable output). The output root defaults to `.codex-workflows/` in the directory you invoke the runner from.
+
+Optional starter for assessment/throughput work — generate, then customize it to the repo:
 
 ```bash
-RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs"
-node "$RUNNER" template throughput \
-  --target "$PWD" \
+node "$RUNNER" template throughput --target "$PWD" \
   --objective "Increase throughput of the app" \
   --output .codex-workflows/authored/throughput-workflow.js
 ```
 
-The runner creates `.codex-workflows/<runId>/` by default. Each run contains:
+The template is one convenience starting point, not the goal. Authoring from scratch to fit the task is the norm.
 
-- `workflow.json`: snapshot with `runId`, `taskId`, `workflowName`, `status`, `phases`, `workflowProgress`, totals, logs, and result.
-- `workflows/scripts/<name>-<runId>.js`: persisted workflow script.
-- `subagents/workflows/<runId>/journal.jsonl`: append-only `started` and `result` events keyed by `v2:<sha256>`.
-- `subagents/workflows/<runId>/agent-*.jsonl` and `agent-*.final.txt`: child Codex traces and final outputs.
-- Worktree-isolated agents also write `agent-*.worktree.patch` and `agent-*.worktree.json`; changed worktrees are kept for parent/integrator review, while unchanged worktrees are removed automatically.
+## Script contract
 
-Resume from an existing run directory:
-
-```bash
-RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs"
-node "$RUNNER" run --resume .codex-workflows/wf_abc123def456
-```
-
-Completed `agent()` calls with the same prompt and normalized options are returned from the journal cache.
-
-## Workflow Script Contract
-
-Write plain JavaScript, not TypeScript. Begin with a pure literal `meta` block:
+Plain JavaScript, not TypeScript. The file must begin with a **pure-literal** `meta` block (no functions, arrows, spreads, template strings, `new`, `Date`, `Math`, `require`, or `import` inside it). Use the same phase titles in `meta.phases` as in your `phase()` calls.
 
 ```js
 export const meta = {
   name: 'review-changes',
-  description: 'Review changed files and verify findings',
+  description: 'Review changed files across dimensions, verify each finding',
   phases: [
     { title: 'Review', detail: 'dimension readers' },
-    { title: 'Verify', detail: 'skeptical checks' },
+    { title: 'Verify', detail: 'skeptical refutation' },
   ],
 }
 
+const DIMENSIONS = [
+  { key: 'bugs', prompt: 'Find correctness bugs in the changed files. Cite file:line.' },
+  { key: 'tests', prompt: 'Find missing or weak test coverage in the changed files. Cite file:line.' },
+]
+
 phase('Review')
-const findings = await pipeline(
-  ['bugs', 'tests'],
-  dimension => agent(`Review for ${dimension}`, { label: `review:${dimension}`, schema: FINDINGS_SCHEMA }),
-  result => parallel(result.findings.map(f => () =>
-    agent(`Verify this finding: ${JSON.stringify(f)}`, { phase: 'Verify', schema: VERDICT_SCHEMA })
-  ))
+const results = await pipeline(
+  DIMENSIONS,
+  d => agent(d.prompt, { label: `review:${d.key}`, phase: 'Review', schema: FINDINGS_SCHEMA })
+        .catch(() => ({ findings: [] })),              // tolerate one failed lens (see pipeline caveat)
+  review => parallel(review.findings.map(f => () =>
+    agent(`Adversarially verify this finding. Try to refute it. Return data only.\n${JSON.stringify(f)}`,
+          { label: `verify:${f.id}`, phase: 'Verify', schema: VERDICT_SCHEMA })
+      .then(v => ({ ...f, verdict: v }))))
 )
 
-return findings.flat().filter(Boolean)
+return results.flat().filter(Boolean).filter(f => f.verdict?.isReal)
 ```
 
-Runtime globals:
+The workflow's `return` value becomes `workflow.json.result` — that is what you read back and synthesize from.
 
-- `agent(prompt, opts)`: spawn a child Codex run. Supports `label`, `phase`, `schema`, `model`, and `isolation`. `schema` is passed to `codex exec --output-schema`.
-- `agentType` is not supported by Codex child delegation yet; the runner fails fast if a workflow sets it, so scripts do not silently get generic-agent behavior.
-- `isolation: "worktree"` requires the parent git worktree to be clean outside the runner's own output directory, creates a temporary git worktree, runs the child there, captures a patch/status record, keeps changed worktrees for parent/integrator review, and removes unchanged worktrees automatically.
-- `parallel(thunks)`: barrier; run thunks concurrently and return `null` for failed thunks.
-- `pipeline(items, ...stages)`: default multi-stage shape; each item advances through stages independently, without a phase barrier.
-- `phase(title)`: assign later `agent()` calls to a progress phase.
-- `log(message)`: append a run log.
-- `workflow(ref, args)`: run one child workflow by `{scriptPath}` or direct script path. Nesting is limited to one level.
-- `args`: parsed JSON value from `--args` or `--args-file`.
-- `budget`: exposes `total`, `spent()`, and `remaining()` using approximate token accounting.
+### Runtime globals (exact Codex semantics)
 
-The VM blocks `Date.now()`, argless `new Date()`, `Math.random()`, `require`, `process`, and filesystem APIs inside workflow scripts. Pass timestamps through `args`.
+- **`agent(prompt, opts) → Promise`** — spawns one child `codex exec`. `opts`: `label`, `phase`, `schema` (JSON Schema, enforced via `--output-schema`), `model`, `isolation: 'worktree'`. Without `schema` it returns the child's trimmed final text; with `schema` it returns the parsed/validated object. **A failed child throws** — see the pipeline caveat. `agentType` is **rejected** (fails fast); configure child behavior through the prompt and `model` instead.
+- **`parallel(thunks) → Promise<any[]>`** — barrier. Runs all thunks concurrently, awaits them, and returns `null` in place of any thunk that threw. Always `.filter(Boolean)` the result. Use only when you genuinely need all results together.
+- **`pipeline(items, ...stages) → Promise<any[]>`** — the default multi-stage shape, **no barrier between stages**. Each item flows through every stage independently (item A can be at stage 3 while item B is at stage 1). Each stage callback receives `(prevResult, originalItem, index)`. A stage that **returns `null`** drops that item (result `null`, remaining stages skipped). **Codex divergence — a stage that *throws* rejects the entire pipeline** (unlike Claude, where it drops just that item). If you need per-item fault tolerance, `.catch()` inside the stage and return `null`, or put the fan-out in a `parallel()` *inside* a stage (which isolates).
+- **`phase(title)`** — groups later `agent()` calls under a progress phase. **`log(message)`** — appends a run log.
+- **`workflow(ref, args) → Promise`** — runs one child workflow by script path (`'path.js'` or `{ scriptPath: 'path.js' }`). One level of nesting only; **no named registry**. Shares the parent's budget and agent cap.
+- **`args`** — the parsed `--args` / `--args-file` value. **`budget`** — `{ total, spent(), remaining() }`, approximate (chars/4 accounting); `total` is `null` unless `--budget-tokens` is set.
 
-## Execution Modes
+### Determinism sandbox
 
-Use real child Codex delegation for validation:
+Workflow scripts run in a locked VM. These **throw**: `Date.now()`, argless `new Date()`, `Math.random()`, `require`, `process`, `setTimeout`, `setInterval`. Pass timestamps and seeds through `args`; vary fan-out by `index`. `console.log` is routed to `log()`. This is what makes runs replayable — don't fight it.
 
-```bash
-RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs"
-node "$RUNNER" run workflow.js \
-  --workspace "$PWD" \
-  --sandbox read-only \
-  --max-concurrency 4 \
-  --max-agents 1000
+## pipeline vs parallel: the decision
+
+**Default to `pipeline()`.** A barrier (`parallel()` between stages) is correct *only* when stage N needs cross-item context from all of stage N-1:
+
+- dedupe/merge across the full result set before expensive downstream work,
+- early-exit on the total (e.g. "0 findings → skip verification entirely"),
+- a stage that compares against "all the other findings."
+
+A barrier is **not** justified by "I need to flatten/map/filter first" (do that inside a stage: `pipeline(items, a, r => transform([r]).flat(), b)`) or "it reads cleaner." Smell test: if you wrote `const a = await parallel(...); const b = a.flat().map(...); const c = await parallel(b...)`, that middle transform has no cross-item dependency — rewrite it as a pipeline with the transform inside a stage. When in doubt, pipeline.
+
+When a barrier *is* right (dedup before verify):
+
+```js
+const all = await parallel(DIMENSIONS.map(d => () => agent(d.prompt, { schema: FINDINGS_SCHEMA })))
+const deduped = dedupeByFileAndLine(all.filter(Boolean).flatMap(r => r.findings))  // needs ALL at once
+const verified = await parallel(deduped.map(f => () => agent(verifyPrompt(f), { schema: VERDICT_SCHEMA })))
 ```
 
-Use mock mode only for runtime smoke tests:
+## Quality patterns (compose freely)
 
-```bash
-RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs"
-node "$RUNNER" run workflow.js --mock-agent
-```
+Real, runnable shapes. Pick by task; combine them. Every child prompt should follow the child-agent discipline below.
 
-Use `--json` when another tool needs machine-readable output.
+- **Adversarial verify** — N independent skeptics per finding, each told to *refute*; kill unless a majority confirms. Stops plausible-but-wrong findings from surviving.
+  ```js
+  const votes = await parallel(Array.from({ length: 3 }, (_, i) => () =>
+    agent(`Refute this claim if you can; default to refuted=true when uncertain. (reviewer ${i})\n${claim}`,
+          { schema: VERDICT_SCHEMA })))
+  const survives = votes.filter(Boolean).filter(v => !v.refuted).length >= 2
+  ```
+- **Perspective-diverse verify** — when a finding can fail in more than one way, give each verifier a distinct lens (`correctness`, `security`, `repro`) instead of N identical skeptics.
+- **Judge panel** — generate N independent attempts from different angles, score with parallel judges, synthesize from the winner while grafting the best of the runners-up. Beats one-attempt-iterated when the solution space is wide.
+- **Loop-until-dry** — for unknown-size discovery, keep spawning finders until K consecutive rounds surface nothing new; dedup against *everything seen*, not just confirmed, or it never converges.
+- **Loop-until-budget** — scale depth to a token target. Guard on `budget.total` or the loop runs to the agent cap:
+  ```js
+  const found = []
+  while (budget.total && budget.remaining() > 50000) {
+    const r = await agent('Find one more high-leverage issue not already listed.', { schema: BUGS_SCHEMA })
+    found.push(...r.bugs); log(`${found.length} found, ${Math.round(budget.remaining()/1000)}k left`)
+  }
+  ```
+- **Multi-modal sweep** — parallel finders each searching a *different* way (by file, by symbol, by entity, by time); one angle alone won't find everything.
+- **Completeness critic** — a final agent that asks "what's missing — a lens not run, a claim unverified, a file unread?" Its answer becomes the next round.
+- **No silent caps** — if you bound coverage (top-N, no-retry, sampling), `log()` what you dropped. Silent truncation reads as "covered everything" when it didn't.
 
-## Reverse-Engineered Notes
+Scale the pattern to the ask: "find any bugs" → a few finders, single-vote verify; "thoroughly audit this" → a larger finder pool, 3–5-vote adversarial pass, explicit synthesis stage.
 
-Read [references/codex-dynamic-workflows.md](references/codex-dynamic-workflows.md) when implementing new features or comparing workflow runner behavior. It records the observed prompt contract, local snapshot schema, journal schema, permission-preview behavior, and known gaps.
+## Designing the loop for a new task
 
-## Validation Checklist
+Workflows are control loops, not a fixed menu of phase names. Before authoring, derive the loop by answering six questions:
 
-Before claiming a workflow run succeeded:
+1. **Unit of work** — file, crate, route, command, finding, failing test, dependency tier, design option, duplicate cluster?
+2. **Truth source** — static code, docs/specs, the compiler, tests, runtime probes, benchmark numbers, or a cross-agent vote?
+3. **What runs independently** — read-only discovery, file-disjoint edits, command probes, per-item classification, verifier votes?
+4. **What must be serialized** — shared-tree mutation, global build/test/git, the final architecture decision, cross-shard clustering, integration?
+5. **The gate** — all items classified, no confirmed findings, build green, probes pass, benchmark improves, or `MAX_ROUNDS` reached?
+6. **What failure looks like** — low confidence, disputed votes, blocked dependency, compile error, panic signature, regression?
 
-- Inspect `workflow.json` and confirm `status` is `completed`.
-- Confirm `workflowProgress` has the expected phase and agent records. It is a flat array; filter records by `type === "workflow_phase"` or `type === "workflow_agent"`.
-- Inspect `journal.jsonl`; every non-cached child `agent()` should have a `started` event and a `result` event.
-- For schema-shaped agents, parse the returned object from `workflow.json` or `journal.jsonl`, not only the child transcript.
-- Treat mock-agent runs as runtime checks only; use real child Codex runs to validate delegation.
+Then compose phases from primitives: **fan out** for independent read-only exploration or disjoint edits; **fan in** to dedupe/cluster/judge/rank/synthesize before spending mutation budget; **refute** with independent verifiers when false positives are expensive; **vote + tiebreak** when judgments are noisy; **serialize** mutation when agents share files/build/git; **probe** with executable commands when the system can reveal the next failure; **repeat** only around an external gate with an explicit `MAX_ROUNDS`, success predicate, and a defined "still blocked" return shape.
+
+Named shapes are *derivations* of these choices, not presets — e.g. `Classify → Sample-Verify → Synthesize` (many items, taxonomy truth, error-rate gate); `Panel → Judge → Docs` (design options, constraint truth, one decision); `Assess → Serial-Implement → Parallel-Verify → Gate` (subsystems, code+build truth, serialized mutation); `Probe → Dedup → Fix → Repeat` (failing commands, runtime truth, repeat until probes pass); `Shard-Find → CrossRef → Vote → Apply → Compile-Gate` (dedup at scale, one owner of build/git). If the task shape changes mid-run, stop, synthesize what you have, and author the next loop rather than forcing the old one.
+
+Always include a real synthesis step for broad workflows — never just concatenate child outputs.
+
+## Choosing scale
+
+- **Narrow known fix:** 1 implementer + 1 verifier.
+- **Focused problem / small app:** 2–3 assessors across the most relevant lenses, then verify the top findings.
+- **Medium app:** 4–6 assessors (e.g. runtime hot paths, data access, concurrency/I/O, frontend/delivery, observability/tests, plus one domain lens).
+- **Broad/high-risk audit:** 6–10 assessors plus independent verification. Exceed this only when the problem is genuinely large and the user accepts the cost.
+
+## Sandbox and mutation discipline
+
+- **`read-only` is the default and the only mode that caches/resumes.** Use it for all assessment, review, and research workflows.
+- Use **`workspace-write`** only for narrow implementer agents the user asked for or approved. Mutating runs never replay the journal cache.
+- Keep mutation **serialized or file-disjoint.** Let exactly one agent own global build/test/git. Fan out read-only discovery aggressively; never fan out conflicting edits to a shared tree.
+- **`isolation: 'worktree'`** runs a mutating agent in a throwaway git worktree. It requires the parent tree to be clean outside the runner's own output dirs, captures the child's diff as `agent-*.worktree.patch`, keeps changed worktrees for you to inspect/apply, and removes unchanged ones. There is **no automatic merge** — you (or an integrator agent) apply accepted patches.
+
+## Child-agent prompt discipline (Codex's #1 quality lever)
+
+Child Codex agents do **not** automatically know they're inside a workflow. Unlike Claude's harness, they won't infer that their output is data or that a custom agent profile applies. Put it in the prompt, every time:
+
+- **"Your final output is the return value of this step — return data, not a human-facing summary."** Otherwise children write prose where you expect structured data.
+- **Bound the lens.** One clear job per agent ("only data-access bottlenecks", "only this file").
+- **Demand citations** — file paths, `file:line`, functions, commands, request paths. **Forbid invented metrics or benchmarks.**
+- **If a `schema` is set, tell the child to obey it exactly** and to put evidence in the schema fields.
+- For verifiers: instruct them to actually open the cited code and default to skeptical (`isReal=false` / `refuted=true`) when evidence is weak.
+
+## After the run: verify before you trust
+
+- Open `workflow.json`; confirm `status` is `completed` (a thrown pipeline stage, exhausted budget, or hit agent cap leaves `status: failed` with an `error`).
+- `workflowProgress` is a **flat array** — filter by `type === 'workflow_phase'` and `type === 'workflow_agent'`. Each agent record carries `state`, `label`, `phaseTitle`, `model`, `tokens`, `durationMs`, `resultPreview`, `cachePath`, and (for isolated agents) `worktree`.
+- `journal.jsonl` holds `started` + `result` events per non-cached `agent()`. A `started` with no `result` means the child failed before finishing — read `subagents/workflows/<runId>/agent-*.stderr.txt`.
+- For schema agents, parse the object from `workflow.json.result` or the journal `result` — **not** from the child transcript.
+- `summarize <run-dir>` gives a one-line status/agent/token read; add `--json` for the full structured summary.
+- **`--mock-agent` validates script mechanics only** (it synthesizes fake results from schemas). It does not validate delegation, model behavior, or output quality — never report a mock run as a real result.
+
+## inspect is a rough estimate, not a count
+
+`inspect` is a static preview: it counts `agent()`/`parallel()`/`pipeline()`/loops, previews `meta`, and flags determinism violations and unsupported `agentType`/isolation before you spend money. Its `estimatedAgents` is a crude heuristic that can **over- or under-count** data-dependent fan-out (one `agent()` site inside a `pipeline()` over a 50-item array runs 50 times; a small fan-out can be over-counted). The authoritative number is `workflow.json.agentCount` *after* the run. Treat `inspect` as a smoke check and a lint pass, never as the real plan.
+
+## Resume and caching
+
+In `read-only` runs, every `agent()` result is journaled under a `v2:` key derived from prompt + normalized options + call-path + workspace. `run --resume <run-dir>` replays unchanged calls instantly from the journal and only re-runs new or edited ones — same script + same args = full cache hit. Mutating (`workspace-write`) runs intentionally never replay cache. Resume reuses the prior run's `scriptPath`, `runId`, `workspace`, `args`, `sandbox`, and `childModel` unless you override them.
+
+## Nested-Codex caveat
+
+If you launch this runner from *inside* another sandboxed Codex child, the nested `codex exec` calls can fail before any model work with errors like `attempt to write a readonly database`, `failed to initialize in-process app-server client`, or disabled DNS. That is an infrastructure failure, not a workflow-script bug — failed runs still leave `workflow.json`, child `stderr` files, and a journal with `started` but no `result` events. Run workflows from the **top-level Codex session**, or start the outer child with enough access to initialize Codex state and the app-server. `--mock-agent` can still validate mechanics in a constrained sandbox.
+
+## Reference
+
+For the observed Claude/Codex workflow contract, snapshot/journal schemas, and notes for extending the runner itself, see [references/codex-dynamic-workflows.md](references/codex-dynamic-workflows.md). You don't need it to author or run workflows — only when modifying the runtime.
