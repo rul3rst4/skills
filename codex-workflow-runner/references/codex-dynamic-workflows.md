@@ -2,7 +2,7 @@
 
 This reference documents the workflow script contract, the local snapshot and journal schema, and the static-inspection behavior of this Codex runner. The runner is a Codex-native adaptation of [`earendil-works/pi-dynamic-workflows`](https://github.com/Michaelliv/pi-dynamic-workflows) (a Pi extension that runs subagents as in-memory sessions), which is itself a clean-room take on Anthropic's dynamic workflows in Claude Code. It is a compatibility and design guide, not a claim about Pi or Anthropic internals.
 
-The defining adjustment for Codex: where the Pi extension spawns in-memory subagent sessions inside one process, this runner delegates each `agent()` to a child `codex exec` process (`--output-schema` for structured output, `--sandbox`, `-C`, `--model`, `--json`, `--output-last-message`). On top of the shared DSL it adds persisted snapshots, an append-only journal, resume, worktree isolation, one-level `workflow()` composition, and a static `inspect` preview.
+The defining adjustment for Codex: where the Pi extension spawns in-memory subagent sessions inside one process, this runner delegates each `agent()` to a **native Codex subagent**. By default it drives one long-lived, shared `codex app-server` over newline-delimited JSON-RPC and spawns a subagent thread per call (`initialize` → `thread/start` → `turn/start` → `turn/completed`), giving native `outputSchema` enforcement, real token usage, and per-thread model/effort/developer-instructions/sandbox/MCP. A `codex exec` fallback transport (`--transport exec`, also used automatically when the app-server cannot initialize) preserves the original per-process path. On top of the shared DSL it adds persisted snapshots, an append-only journal, resume, worktree isolation, one-level `workflow()` composition, and a static `inspect` preview.
 
 ## Public Script Contract
 
@@ -35,27 +35,31 @@ Restrictions: no TypeScript syntax, no Node filesystem APIs, no timers, no argle
 
 ## Agent Semantics
 
-`agent(prompt, opts)` spawns a child `codex exec` process. Supported options:
+`agent(prompt, opts)` spawns one native Codex subagent thread (app-server transport) or a child `codex exec` process (exec fallback). Supported options:
 
 ```js
 {
-  label: 'display label',       // short label for progress, journals, and errors
-  phase: 'progress phase title',// overrides the current phase for this agent
-  schema: { type: 'object', ... }, // JSON Schema -> codex exec --output-schema
-  model: 'model override',      // -> codex exec --model
-  isolation: 'worktree',        // run in a temporary git worktree, capture a patch
+  label: 'display label',        // short label for progress, journals, and errors
+  phase: 'progress phase title', // overrides the current phase for this agent
+  schema: { type: 'object', ... }, // JSON Schema -> the subagent's native outputSchema
+  model: 'model override',       // per-agent model
+  effort: 'low',                 // reasoning effort: none|minimal|low|medium|high|xhigh
+  instructions: 'persona/role',  // per-agent developer instructions on the subagent thread
+  agentType: 'explorer',         // built-in default/worker/explorer, or a .codex/agents/<name>.toml profile
+  mcpServers: { fs: { command, args, env } }, // extra MCP servers merged into the subagent (alias: tools)
+  isolation: 'worktree',         // run in a temporary git worktree, capture a patch
 }
 ```
 
-Without `schema`, the return value is the child's final message text. With `schema`, the child is run with `--output-schema` and the parent receives the object parsed from its final message. Because `--output-schema` only guides the model (it does not hard-enforce the shape), the runner validates the parsed object against the schema (`validateAgainstSchema`: type, `enum`/`const`, `required`, `additionalProperties:false`, nested `properties`/`items`) and fails the agent if it does not conform, rather than propagating wrong-shaped data — restoring the validation guarantee the Pi extension gets from its TypeBox-backed `structured_output` tool. The runner frames every child so its final message is treated as the return value (no human-facing prose; for schema agents, raw JSON only).
+Without `schema`, the return value is the subagent's final message text. With `schema`, the turn is started with a native `outputSchema`, so the model is constrained to emit conforming JSON; the runner additionally parses and validates the result (`validateAgainstSchema`: type, `enum`/`const`, `required`, `additionalProperties:false`, nested `properties`/`items`). On a violation it re-asks the same subagent up to `--schema-retries` times (default 1) before failing — restoring (and strengthening) the validation guarantee the Pi extension gets from its TypeBox-backed `structured_output` tool. The runner frames every subagent so its final message is treated as the return value (no human-facing prose; for schema agents, raw JSON only).
 
-`agentType` is part of the upstream DSL but is **not supported** here: the Pi/Claude versions map it to custom subagent profiles, which have no Codex equivalent yet, so the runner fails fast rather than silently running a generic child. `isolation: "worktree"` is patch-based (see below), not an automatic merge.
+`agentType` is now **supported**: built-in `default`/`worker`/`explorer`, or any `.codex/agents/<name>.toml` profile (resolved from the workspace then `CODEX_HOME`). A profile's `developer_instructions`, `model`, `model_reasoning_effort`, `sandbox_mode`, and `mcp_servers` are mapped onto the subagent thread; per-agent `model`/`instructions`/`effort` override the profile, and a profile's `sandbox_mode` is clamped to the run's `--sandbox` ceiling. `mcpServers`/`tools` (and MCP-declaring profiles) require the app-server transport. `isolation: "worktree"` is patch-based (see below), not an automatic merge.
 
 ## Parallel Versus Pipeline
 
 `parallel(thunks)` is a barrier. It waits for every thunk and returns `null` for failed thunks.
 
-`pipeline(items, ...stages)` is not a barrier between stages. Each item runs its stage chain independently, so item A can verify while item B is still reviewing. This is the default shape to reduce idle time.
+`pipeline(items, ...stages)` is not a barrier between stages. Each item runs its stage chain independently, so item A can verify while item B is still reviewing. This is the default shape to reduce idle time. Failure isolation matches `parallel()` and the pi/Claude model: a stage that returns `null` **or throws** (including a failed `agent()`) drops just that one item to `null` and skips its remaining stages — it never rejects the whole pipeline.
 
 ## Observed Authoring Patterns
 
@@ -130,6 +134,11 @@ totalTokens
 totalToolCalls
 logs
 result
+sandbox
+transport        (appserver | exec; reflects the actual transport after any fallback)
+schemaRetries
+childModel
+budgetTokens
 defaultModel
 timestamp
 ```
@@ -162,9 +171,9 @@ Events:
 {"type":"result","key":"v2:<64 hex>","agentId":"...","result":{...}}
 ```
 
-The `v2:` key hashes a normalized `agent()` call identity: prompt, normalized options (schema, label, phase, model, isolation), workspace, mock flag, and a stable call-path that encodes the invocation position. The call-path component keeps repeated identical prompts in loops or fan-out stages from collapsing to one cache entry, so resume is deterministic. Cached results are only replayed when the run is `--sandbox read-only`; mutating runs always re-run.
+The `v2:` key hashes a normalized `agent()` call identity: prompt, normalized options (schema, label, phase, model, isolation, agentType, instructions, effort, mcpServers/tools), the **resolved agentType profile digest** (developer instructions, model, effort, sandbox, mcp servers — so editing a `.codex/agents/<name>.toml` profile invalidates the cache), workspace, mock flag, and a stable call-path that encodes the invocation position. The call-path component keeps repeated identical prompts in loops or fan-out stages from collapsing to one cache entry, so resume is deterministic. The transport (appserver/exec) is intentionally **not** part of the key — results are transport-agnostic, so an exec run can replay an app-server run's cache and vice versa. Cached results are only replayed when the run is `--sandbox read-only`; mutating runs always re-run.
 
-Current Codex runner note: `agentType` is intentionally rejected at runtime until Codex can map it to real child-agent profiles. `isolation: "worktree"` requires the parent git worktree to be clean outside the runner's own output directory, then runs the child in a temporary worktree, captures a patch/status artifact, keeps changed worktrees for integrator review, and removes unchanged worktrees.
+Current Codex runner note: `agentType` is supported (built-in `default`/`worker`/`explorer` or a `.codex/agents/<name>.toml` profile), and the resolved profile is part of the cache key, so editing a profile re-runs the affected agents on the next `--resume`. `isolation: "worktree"` requires the parent git worktree to be clean outside the runner's own output directory, then runs the child in a temporary worktree, captures a patch/status artifact, keeps changed worktrees for integrator review, and removes unchanged worktrees.
 
 ## Static Inspect (Permission Preview)
 
@@ -172,28 +181,33 @@ The `inspect` command is a static preview, analogous to Claude Code's permission
 
 - Count `agent()`, `parallel()`, `pipeline()`, `map()`, and loops.
 - Flag `agent()` calls nested inside loops, `map()`, `parallel()`, or `pipeline()` as dynamic fan-out, so `estimatedAgents` is reported as a lower bound.
-- Flag determinism violations (`Date.now()`, `Math.random()`, argless `new Date()`) and unsupported `agentType`/`isolation` usage before execution.
+- Flag determinism violations (`Date.now()`, `Math.random()`, argless `new Date()`) and unsupported `isolation` modes before execution. (`agentType` is counted but no longer warned — it is supported.)
 
 Because it is AST-based rather than regex-based, it correctly counts `agent()` calls hidden inside nested template literals — a case the previous string-scanning inspector missed (it reported `agentCalls: 0` for pipelines whose stage prompts used backtick-nested code fences). The authoritative count is always `workflow.json.agentCount` after a run.
 
 ## Codex Nesting Caveat
 
-Running this runner from a top-level Codex session can spawn child `codex exec` agents with `--sandbox read-only`. Running it from inside another sandboxed Codex child can fail before model work if the outer sandbox prevents writes to Codex state under `~/.codex` or blocks the app-server/local network path needed by the CLI. In that case:
+Running this runner from a top-level Codex session spawns native subagents through one shared `codex app-server`. Running it from inside another sandboxed Codex child can fail before model work if the outer sandbox prevents writes to Codex state under `~/.codex` or blocks the app-server/local network path. When the app-server cannot initialize, the run logs a warning and auto-falls-back to `--transport exec`, which can fail the same way under the same constraints. In that case:
 
 - Use `--mock-agent` only to validate script mechanics.
 - For real delegation, run the workflow from the top-level Codex session, or start the outer child with access that allows Codex state/app-server initialization.
-- Do not confuse this infrastructure failure with a workflow-script failure; failed runs still leave `workflow.json`, child stderr files, and `journal.jsonl` with `started` events but no `result` events.
+- Do not confuse this infrastructure failure with a workflow-script failure; failed runs still leave `workflow.json`, subagent `meta.json`/`stderr` files, and `journal.jsonl` with `started` events but no `result` events.
 
 ## Compatibility Gaps
 
 This runner intentionally does not replicate:
 
-- The Pi/Claude Code terminal UI or live `/workflows` progress view.
-- Pi in-memory subagent sessions (it shells out to `codex exec` per agent instead).
-- Custom `agentType`/subagent-profile behavior.
+- The Pi/Claude Code terminal UI or live `/workflows` progress view (snapshots + journal only).
 - Cloud-hosted workflow execution.
 - Automatic merge/apply of worktree-isolated agent patches (patches are captured for an integrator).
-- Exact token accounting (budget uses an approximate char/4 estimate).
 - A named built-in workflow registry (`workflow()` resolves by script path only).
 
-It does implement the reusable contract needed for Codex-native orchestration: AST-validated JS scripts, child `codex exec` delegation, schema-shaped outputs via `--output-schema`, snapshot persistence, journal replay/resume, progress records, worktree isolation, one-level `workflow()` composition, a lifetime agent cap, and static inspection.
+Gaps that the app-server subagent transport **closes** (previously listed here):
+
+- Pi in-memory subagent sessions → now native Codex subagent threads on one shared `codex app-server` (the per-agent `codex exec` path remains as `--transport exec`).
+- Custom `agentType`/subagent-profile behavior → supported via built-ins and `.codex/agents/<name>.toml`.
+- MCP/tool bridging to children → subagents inherit the session's MCP servers and accept per-agent `mcpServers`.
+- Exact token accounting → real subagent token usage from the app-server (`exec`/mock fall back to char/4).
+- Schema enforcement → native `outputSchema` plus post-hoc validation with bounded `--schema-retries`.
+
+It implements the reusable contract needed for Codex-native orchestration: AST-validated JS scripts, native subagent delegation (with an exec fallback), schema-shaped outputs via native `outputSchema`, real token accounting, snapshot persistence, journal replay/resume, progress records, worktree isolation, one-level `workflow()` composition, a lifetime agent cap, and static inspection.

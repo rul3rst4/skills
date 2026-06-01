@@ -38,12 +38,17 @@ Run options:
   --args <json>              JSON value exposed as global args
   --args-file <file>         JSON file exposed as global args
   --run-id <wf_id>           Explicit run id for new runs
-  --sandbox <mode>           Child Codex sandbox (default: read-only)
+  --sandbox <mode>           Subagent sandbox (default: read-only)
+  --transport <mode>         Subagent transport: appserver (default) or exec.
+                             appserver spawns native Codex subagent threads via
+                             one shared codex app-server; exec is the legacy
+                             per-agent codex exec fallback.
   --codex-bin <path>         Codex binary (default: codex)
-  --child-model <model>      Model passed to child codex exec
+  --child-model <model>      Default model for each subagent
+  --schema-retries <n>       Re-ask a schema-violating subagent N times (default: 1)
   --max-concurrency <n>      Agent concurrency cap (default: min(16, cpu-2))
   --max-agents <n>           Total lifetime agent cap (default: 1000)
-  --budget-tokens <n>        Approximate budget exposed via budget.total
+  --budget-tokens <n>        Token budget exposed via budget.total
   --mock-agent               Return deterministic fake agent results
   -h, --help                 Show this help
   --json                     Print machine-readable JSON
@@ -63,8 +68,10 @@ function parseCli(argv) {
     'args-file',
     'run-id',
     'sandbox',
+    'transport',
     'codex-bin',
     'child-model',
+    'schema-retries',
     'max-concurrency',
     'max-agents',
     'budget-tokens',
@@ -618,8 +625,6 @@ function inspectScript(text) {
 
   const warnings = [
     ...collectDeterminismWarnings(ast),
-    ...Array.from({ length: agentsWithAgentType }, () =>
-      'agentType is not supported by this runner and will fail fast at runtime.'),
     ...unsupportedIsolation.map((isolation) => `Unsupported agent isolation mode detected statically: ${isolation}`),
   ]
   const estimatedAgents = dynamicAgentCalls > 0
@@ -1063,6 +1068,8 @@ async function executeWorkflow(input) {
     args: input.args,
     workspace: input.workspace,
     sandbox: input.sandbox,
+    transport: input.transport || 'appserver',
+    schemaRetries: input.schemaRetries ?? 1,
     childModel: input.childModel,
     budgetTokens: input.budgetTokens ?? null,
     agentLimit: agentLimit.snapshot(),
@@ -1080,6 +1087,20 @@ async function executeWorkflow(input) {
   const semaphore = new Semaphore(input.maxConcurrency)
   let spentTokens = 0
   const sharedBudget = input.sharedBudget || createBudgetTracker(input.budgetTokens ?? null)
+  // Shared Codex app-server subagent transport: one long-lived process per run,
+  // reused by every agent() and every nested workflow(). The top-level run owns
+  // its lifecycle; nested runs receive it via input.appServer. The process is
+  // started lazily on the first real agent (see ensureTransportReady), so a
+  // fully-cached read-only resume never spawns it.
+  let appServer = input.appServer || null
+  const ownsAppServer = !input.appServer && input.transport === 'appserver' && !input.mockAgent
+  if (ownsAppServer) appServer = new CodexAppServer({ codexBin: input.codexBin, onLog: (message) => log(message) })
+  let transportPrep = null
+  // A single deterministic CODEX_HOME for agentType profile resolution, computed
+  // independently of app-server start timing so every agent in the run resolves
+  // profiles identically and the cache key stays stable. The spawned app-server
+  // inherits the same env, so this matches the home it reports.
+  const runCodexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
   const cachePathStorage = new AsyncLocalStorage()
   const agentPathCounts = new Map()
   const workflowPathCounts = new Map()
@@ -1132,21 +1153,26 @@ async function executeWorkflow(input) {
 
   function normalizeAgentOptions(opts = {}) {
     const normalized = {}
-    for (const key of ['label', 'phase', 'schema', 'model', 'isolation', 'agentType', 'cacheKey']) {
+    for (const key of ['label', 'phase', 'schema', 'model', 'isolation', 'agentType', 'instructions', 'effort', 'mcpServers', 'tools', 'cacheKey']) {
       if (opts[key] !== undefined) normalized[key] = opts[key]
     }
     return normalized
   }
 
   function validateAgentOptions(opts = {}) {
-    if (opts.agentType !== undefined) {
-      throw new Error('agentType is not supported by this runner; configure child prompts/models explicitly instead')
+    if (opts.agentType !== undefined && typeof opts.agentType !== 'string') {
+      throw new Error('agent() opts.agentType must be a string (a built-in default/worker/explorer, or a .codex/agents/<name>.toml profile name)')
     }
-    if (opts.tools !== undefined) {
-      throw new Error('per-agent tools are not supported by this runner; child codex exec processes use Codex\'s own tool surface')
+    if (opts.instructions !== undefined && typeof opts.instructions !== 'string') {
+      throw new Error('agent() opts.instructions must be a string (mapped to the subagent thread developer instructions)')
     }
-    if (opts.instructions !== undefined) {
-      throw new Error('per-agent instructions are not supported by this runner; put guidance directly in the agent() prompt')
+    if (opts.effort !== undefined && normalizeEffort(opts.effort) === null) {
+      throw new Error(`agent() opts.effort must be one of ${[...VALID_EFFORTS].join(', ')}`)
+    }
+    for (const key of ['mcpServers', 'tools']) {
+      if (opts[key] !== undefined && (typeof opts[key] !== 'object' || opts[key] === null || Array.isArray(opts[key]))) {
+        throw new Error(`agent() opts.${key} must be an object of { serverName: { command, args, env } } mcp server definitions`)
+      }
     }
     if (opts.isolation === undefined || opts.isolation === 'shared') return
     if (opts.isolation === 'worktree') return
@@ -1203,21 +1229,66 @@ async function executeWorkflow(input) {
     throw agentLimitError
   }
 
+  // Lazily start the shared app-server on the first real agent. On failure, fall
+  // back to `codex exec` for the whole run. Memoized so concurrent agents share
+  // one start attempt; only the run that owns the server stops it on fallback.
+  async function ensureTransportReady() {
+    if (input.transport !== 'appserver' || !appServer || input.mockAgent) return
+    if (!transportPrep) {
+      transportPrep = appServer.start().then(
+        () => true,
+        async (error) => {
+          log(`app-server transport unavailable, falling back to codex exec: ${error.message}`)
+          if (ownsAppServer) await appServer.stop().catch(() => {})
+          appServer = null
+          input.transport = 'exec'
+          state.transport = 'exec'
+          await persist()
+          return false
+        }
+      )
+    }
+    await transportPrep
+  }
+
   async function agent(prompt, opts = {}) {
     if (typeof prompt !== 'string') throw new Error('agent(prompt) requires a string prompt')
     validateAgentOptions(opts)
     const effectiveModel = opts.model || input.childModel
+    // Resolve the agentType profile + per-agent overrides up front so the
+    // *resolved* behavior participates in the cache key — editing a
+    // .codex/agents/<name>.toml profile then invalidates cached results. A
+    // resolution error (missing agentType, mcp-on-exec) is deferred so the
+    // agent still gets a recorded failed progress entry below.
+    let settings = null
+    let settingsError = null
+    if (!input.mockAgent) {
+      try {
+        settings = await resolveAgentSettings(opts, {
+          workspace: input.workspace,
+          codexHome: runCodexHome,
+          sandbox: input.sandbox,
+          transport: input.transport,
+        })
+      } catch (error) {
+        settingsError = error
+      }
+    }
     const normalizedOpts = normalizeAgentOptions({
       ...opts,
       ...(effectiveModel !== undefined ? { model: effectiveModel } : {}),
     })
     const callPath = nextAgentCachePath(opts)
+    const profileDigest = settings
+      ? { developerInstructions: settings.developerInstructions, effort: settings.effort, mcpServers: settings.mcpServers, profileModel: settings.profileModel, sandbox: settings.sandbox }
+      : null
     const key = `v2:${sha256(stableJson({
       callPath,
       workspace: input.workspace,
       mockAgent: Boolean(input.mockAgent),
       prompt,
       opts: normalizedOpts,
+      profile: profileDigest,
     }))}`
     const cached = input.sandbox === 'read-only' ? journal.get(key) : null
     const label = opts.label || prompt.split('\n').find(Boolean)?.slice(0, 48) || `agent-${state.agentCount + 1}`
@@ -1271,38 +1342,54 @@ async function executeWorkflow(input) {
       const started = Date.now()
       let result
       let worktree = null
+      let realTokens = null
       try {
         if (input.mockAgent) {
           result = mockResult(opts.schema, prompt, label)
-        } else if (opts.isolation === 'worktree') {
-          const response = await runWorktreeChildCodex({
-            prompt: buildChildPrompt(prompt, { schema: opts.schema, label, phase: requestedPhaseTitle }),
-            schema: opts.schema,
-            agentId: progress.agentId,
-            subagentDir,
-            runDir,
-            outRoot,
-            workspace: input.workspace,
-            sandbox: input.sandbox,
-            codexBin: input.codexBin,
-            childModel: effectiveModel,
-          })
-          result = response.result
-          worktree = response.worktree
-          progress.worktree = worktree
         } else {
-          result = await runChildCodex({
+          if (settingsError) {
+            // A config error (e.g. unknown agentType) surfaces here so this agent
+            // gets a recorded failed entry and a log line, even when it is later
+            // swallowed to null by an enclosing parallel()/pipeline().
+            log(`agent "${label}" configuration error: ${settingsError.message}`)
+            throw settingsError
+          }
+          // Start (or fall back from) the shared app-server before dispatching.
+          await ensureTransportReady()
+          const childModel = opts.model || settings.profileModel || input.childModel
+          const childParams = {
+            transport: input.transport,
+            appServer,
             prompt: buildChildPrompt(prompt, { schema: opts.schema, label, phase: requestedPhaseTitle }),
             schema: opts.schema,
             agentId: progress.agentId,
             subagentDir,
             workspace: input.workspace,
-            sandbox: input.sandbox,
+            sandbox: settings.sandbox,
             codexBin: input.codexBin,
-            childModel: effectiveModel,
-          })
+            childModel,
+            effort: settings.effort,
+            developerInstructions: settings.developerInstructions,
+            mcpServers: settings.mcpServers,
+            schemaRetries: input.schemaRetries,
+          }
+          if (childModel) progress.model = childModel
+          if (settings.sandbox && settings.sandbox !== input.sandbox) progress.sandbox = settings.sandbox
+          if (opts.isolation === 'worktree') {
+            const response = await runWorktreeChildCodex({ ...childParams, runDir, outRoot })
+            result = response.result
+            realTokens = response.tokens
+            worktree = response.worktree
+            progress.worktree = worktree
+          } else {
+            const response = await runChildAgent(childParams)
+            result = response.result
+            realTokens = response.tokens
+          }
         }
-        const approx = estimateTokens(prompt) + estimateTokens(JSON.stringify(result))
+        const approx = (realTokens != null && Number.isFinite(realTokens) && realTokens > 0)
+          ? realTokens
+          : (estimateTokens(prompt) + estimateTokens(JSON.stringify(result)))
         spentTokens += approx
         sharedBudget.commit(approx)
         state.totalTokens += approx
@@ -1369,6 +1456,8 @@ async function executeWorkflow(input) {
       budgetTokens: budget.total,
       sharedBudget,
       agentLimit,
+      appServer,
+      transport: input.transport,
     })
     const childTokens = Number(child.totalTokens || 0)
     const childToolCalls = Number(child.totalToolCalls || 0)
@@ -1437,6 +1526,8 @@ async function executeWorkflow(input) {
     state.error = { message: error.message, stack: error.stack }
     await persist()
     throw Object.assign(error, { runDir, workflowJson })
+  } finally {
+    if (ownsAppServer && appServer) await appServer.stop().catch(() => {})
   }
 }
 
@@ -1599,7 +1690,14 @@ function makeVmContext(bindings) {
     return Promise.all(items.map((item, index) => withPath('pipeline:' + callId + ':item:' + index, async () => {
       let previous = item
       for (let stageIndex = 0; stageIndex < stages.length; stageIndex++) {
-        previous = await withPath('stage:' + stageIndex, () => stages[stageIndex](previous, item, index))
+        try {
+          previous = await withPath('stage:' + stageIndex, () => stages[stageIndex](previous, item, index))
+        } catch {
+          // Parity with Claude/pi: a stage that throws (including a failed
+          // agent()) drops this item to null and skips its remaining stages,
+          // rather than rejecting the whole pipeline.
+          return null
+        }
         if (previous === null) return null
       }
       return previous
@@ -1826,15 +1924,18 @@ async function runWorktreeChildCodex(input) {
 
 ${input.prompt}`
   let result
+  let tokens = null
   let childError = null
   let worktreeInfo = null
   try {
-    result = await runChildCodex({
+    const response = await runChildAgent({
       ...input,
       prompt,
       workspace: worktree.childWorkspace,
       isolation: 'worktree',
     })
+    result = response.result
+    tokens = response.tokens
   } catch (error) {
     childError = error
   }
@@ -1853,14 +1954,570 @@ ${input.prompt}`
     if (worktreeInfo) childError.worktree = worktreeInfo
     throw childError
   }
-  return { result, worktree: worktreeInfo }
+  return { result, tokens, worktree: worktreeInfo }
 }
 
-// Frame every child `codex exec` run as a workflow subagent whose final message
-// is consumed as a return value. This mirrors the Pi extension's structured
-// output contract (final action must be the machine-readable result, no trailing
-// prose) and Claude Code workflow agents being told their final text is a return
-// value, adapted to Codex's `--output-schema` mechanism.
+// ---------------------------------------------------------------------------
+// Codex app-server transport (default): drive one long-lived `codex app-server`
+// process over newline-delimited JSON-RPC and spawn each workflow `agent()` as a
+// native Codex subagent thread (`thread/start` + `turn/start`). This replaces
+// the per-agent `codex exec` child process: a single shared process for the
+// whole run (near-zero per-agent cold start), native `outputSchema` enforcement,
+// real token accounting, and per-agent model / reasoning effort / developer
+// instructions / sandbox / MCP servers. `codex exec` remains a fallback
+// transport (`--transport exec`) for environments where the app-server cannot
+// initialize (e.g. some nested sandboxes).
+// ---------------------------------------------------------------------------
+
+const APP_SERVER_INIT_TIMEOUT_MS = Number(process.env.CODEX_WF_INIT_TIMEOUT_MS || 30000)
+const APP_SERVER_TURN_TIMEOUT_MS = Number(process.env.CODEX_WF_TURN_TIMEOUT_MS || 600000)
+const VALID_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+const SANDBOX_RANK = { 'read-only': 0, 'workspace-write': 1, 'danger-full-access': 2 }
+
+function normalizeEffort(value) {
+  if (value === undefined || value === null) return null
+  const text = String(value).trim().toLowerCase()
+  return VALID_EFFORTS.has(text) ? text : null
+}
+
+// Clamp an agent-requested sandbox to the run-level ceiling: an agent profile
+// may narrow the sandbox but never escalate beyond what `--sandbox` granted.
+function clampSandbox(requested, ceiling) {
+  if (!requested) return ceiling
+  const r = SANDBOX_RANK[requested]
+  const c = SANDBOX_RANK[ceiling]
+  if (r === undefined || c === undefined) return ceiling
+  return r <= c ? requested : ceiling
+}
+
+class CodexAppServer {
+  constructor({ codexBin = 'codex', onLog } = {}) {
+    this.codexBin = codexBin
+    this.onLog = typeof onLog === 'function' ? onLog : () => {}
+    this.proc = null
+    this.started = null
+    this.stopped = false
+    this.buf = Buffer.alloc(0)
+    this.pending = new Map() // jsonrpc id -> { resolve, reject, method }
+    this.threads = new Map() // threadId -> { text, tokens, resolveTurn }
+    this.nextId = 1
+    this.stderrTail = []
+    this.initInfo = null
+    this.fatal = null
+  }
+
+  start() {
+    if (this.started) return this.started
+    this.started = new Promise((resolve, reject) => {
+      let proc
+      try {
+        proc = spawn(this.codexBin, ['app-server'], { stdio: ['pipe', 'pipe', 'pipe'] })
+      } catch (error) {
+        reject(new Error(`failed to spawn ${this.codexBin} app-server: ${error.message}`))
+        return
+      }
+      this.proc = proc
+      registerLiveAppServer(this)
+      proc.stdout.on('data', (chunk) => this._onStdout(chunk))
+      proc.stderr.on('data', (chunk) => {
+        this.stderrTail.push(chunk.toString())
+        if (this.stderrTail.length > 80) this.stderrTail.shift()
+      })
+      // A broken stdin pipe (child closed its read end while alive) emits an
+      // 'error' on the stream; without this listener Node escalates it to an
+      // uncaughtException that would crash the whole orchestrator.
+      proc.stdin.on('error', (error) => { if (!this.stopped) this._failAll(new Error(`app-server stdin error: ${error.message}`)) })
+      proc.on('error', (error) => this._failAll(new Error(`app-server process error: ${error.message}`)))
+      proc.on('exit', (code, signal) => {
+        unregisterLiveAppServer(this)
+        if (!this.stopped) this._failAll(new Error(`app-server exited unexpectedly (code=${code} signal=${signal})\n${this._stderr()}`))
+      })
+      const initTimer = setTimeout(
+        () => reject(new Error(`app-server initialize timed out after ${APP_SERVER_INIT_TIMEOUT_MS}ms`)),
+        APP_SERVER_INIT_TIMEOUT_MS
+      )
+      this._request('initialize', {
+        clientInfo: { name: 'codex-workflow-runner', title: 'Codex Workflow Runner', version: VERSION },
+        capabilities: { experimentalApi: true, requestAttestation: false },
+      }).then(
+        (info) => { clearTimeout(initTimer); this.initInfo = info; resolve(info) },
+        (error) => { clearTimeout(initTimer); reject(error) }
+      )
+    })
+    return this.started
+  }
+
+  codexHome() {
+    return this.initInfo?.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
+  }
+
+  _stderr() {
+    return this.stderrTail.join('').split('\n').filter(Boolean).slice(-12).join('\n')
+  }
+
+  _onStdout(chunk) {
+    this.buf = Buffer.concat([this.buf, chunk])
+    while (true) {
+      const nl = this.buf.indexOf(0x0a)
+      if (nl === -1) break
+      const line = this.buf.slice(0, nl).toString('utf8').trim()
+      this.buf = this.buf.slice(nl + 1)
+      if (!line) continue
+      let msg
+      try { msg = JSON.parse(line) } catch { continue }
+      this._handle(msg)
+    }
+  }
+
+  _handle(msg) {
+    if (msg.id !== undefined && msg.method === undefined) {
+      const entry = this.pending.get(msg.id)
+      if (!entry) return
+      this.pending.delete(msg.id)
+      if (msg.error) entry.reject(new Error(`app-server ${entry.method} failed: ${JSON.stringify(msg.error)}`))
+      else entry.resolve(msg.result)
+      return
+    }
+    if (msg.id !== undefined && msg.method) {
+      this._declineServerRequest(msg)
+      return
+    }
+    if (msg.method) this._onNotification(msg.method, msg.params || {})
+  }
+
+  // approvalPolicy:'never' means approval/elicitation requests should never fire;
+  // respond defensively anyway so a stray server->client request can never
+  // deadlock a headless run. A JSON-RPC error reply is universally valid and
+  // always unblocks the server, regardless of the request's expected result
+  // shape, so we use it uniformly rather than guessing per-method decision shapes.
+  _declineServerRequest(msg) {
+    this.onLog(`auto-declined app-server request: ${msg.method}`)
+    try {
+      this._write({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'codex-workflow-runner runs headless; server request auto-declined' } })
+    } catch {}
+  }
+
+  _onNotification(method, params) {
+    const state = params.threadId ? this.threads.get(params.threadId) : null
+    if (!state) return
+    if (method === 'item/completed' && params.item?.type === 'agentMessage') {
+      state.text += params.item.text || ''
+    } else if (method === 'thread/tokenUsage/updated') {
+      const total = params.tokenUsage?.total?.totalTokens
+      if (Number.isFinite(total)) state.tokens = total
+    } else if (method === 'turn/completed') {
+      const turn = params.turn || {}
+      if (!state.text) {
+        const msgs = (turn.items || []).filter((i) => i.type === 'agentMessage').map((i) => i.text || '')
+        if (msgs.length) state.text = msgs.join('')
+      }
+      const resolve = state.resolveTurn
+      state.resolveTurn = null
+      if (resolve) resolve(turn)
+    }
+  }
+
+  _write(obj) {
+    // `proc.killed` is only set after our own .kill(); it stays false when the
+    // child exits/crashes on its own, so gate on fatal/stopped + stream state.
+    if (!this.proc || this.fatal || this.stopped || !this.proc.stdin.writable) {
+      throw this.fatal || new Error('app-server is not running')
+    }
+    this.proc.stdin.write(JSON.stringify(obj) + '\n', (error) => {
+      if (error) this._failAll(new Error(`app-server stdin write failed: ${error.message}`))
+    })
+  }
+
+  _request(method, params) {
+    const id = this.nextId++
+    const promise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject, method }))
+    try {
+      this._write({ jsonrpc: '2.0', id, method, params })
+    } catch (error) {
+      // Don't leak the pending entry if the write fails synchronously.
+      this.pending.delete(id)
+      return Promise.reject(error)
+    }
+    return promise
+  }
+
+  _failAll(error) {
+    this.fatal = error
+    for (const [, entry] of this.pending) entry.reject(error)
+    this.pending.clear()
+    for (const [, state] of this.threads) {
+      if (state.resolveTurn) {
+        const resolve = state.resolveTurn
+        state.resolveTurn = null
+        resolve({ status: 'failed', error: { message: error.message } })
+      }
+    }
+  }
+
+  async runAgent({ prompt, schema, model, effort, developerInstructions, mcpServers, configOverrides, cwd, sandbox, schemaRetries = 1 }) {
+    await this.start()
+    if (this.fatal) throw this.fatal
+    const startParams = { cwd, sandbox, approvalPolicy: 'never', ephemeral: true }
+    if (model) startParams.model = model
+    if (developerInstructions) startParams.developerInstructions = developerInstructions
+    const config = {}
+    if (mcpServers && typeof mcpServers === 'object' && Object.keys(mcpServers).length) config.mcp_servers = mcpServers
+    if (configOverrides && typeof configOverrides === 'object') Object.assign(config, configOverrides)
+    if (Object.keys(config).length) startParams.config = config
+
+    const ts = await this._request('thread/start', startParams)
+    const threadId = ts?.thread?.id
+    if (!threadId) throw new Error(`app-server thread/start returned no thread id: ${JSON.stringify(ts).slice(0, 200)}`)
+    const state = { text: '', tokens: 0, resolveTurn: null }
+    this.threads.set(threadId, state)
+    try {
+      let lastError = null
+      const attempts = Math.max(1, (Number.isInteger(schemaRetries) ? schemaRetries : 1) + 1)
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        if (this.fatal) throw this.fatal
+        state.text = ''
+        const input = attempt === 0
+          ? prompt
+          : `Your previous reply did not satisfy the required JSON output schema:\n${lastError}\nReturn ONLY corrected raw JSON satisfying the schema — no prose, no Markdown, no code fences.`
+        const turn = await this._runTurn({ threadId, state, input, schema, model, effort })
+        if (turn.status !== 'completed') {
+          const detail = turn.error?.message || turn.error?.additionalDetails || turn.status
+          throw new Error(`subagent turn ${turn.status}: ${detail}`)
+        }
+        const text = state.text.trim()
+        if (!schema) return { result: text, tokens: state.tokens }
+        let parsed
+        try { parsed = parseJsonOutput(text) } catch (error) { lastError = error.message; continue }
+        const violations = validateAgainstSchema(parsed, schema, 'result')
+        if (!violations.length) return { result: parsed, tokens: state.tokens }
+        lastError = violations.slice(0, 5).join('; ')
+      }
+      throw new Error(`Structured subagent output did not satisfy the schema after ${attempts} attempt(s): ${lastError}`)
+    } finally {
+      this.threads.delete(threadId)
+    }
+  }
+
+  _runTurn({ threadId, state, input, schema, model, effort }) {
+    return new Promise((resolve, reject) => {
+      let timer = null
+      state.resolveTurn = (turn) => {
+        if (timer) clearTimeout(timer)
+        resolve(turn)
+      }
+      const params = { threadId, input: [{ type: 'text', text: input, text_elements: [] }] }
+      if (schema) params.outputSchema = schema
+      if (model) params.model = model
+      if (effort) params.effort = effort
+      timer = setTimeout(() => {
+        if (!state.resolveTurn) return
+        state.resolveTurn = null
+        reject(new Error(`subagent turn timed out after ${APP_SERVER_TURN_TIMEOUT_MS}ms`))
+      }, APP_SERVER_TURN_TIMEOUT_MS)
+      this._request('turn/start', params).catch((error) => {
+        if (!state.resolveTurn) return
+        state.resolveTurn = null
+        if (timer) clearTimeout(timer)
+        reject(error)
+      })
+    })
+  }
+
+  async stop() {
+    this.stopped = true
+    unregisterLiveAppServer(this)
+    const proc = this.proc
+    if (!proc || proc.killed || proc.exitCode !== null) return
+    try { proc.kill('SIGTERM') } catch {}
+    // Escalate to SIGKILL if it does not exit promptly, so we never leak it.
+    await new Promise((resolve) => {
+      const killTimer = setTimeout(() => { try { proc.kill('SIGKILL') } catch {} ; resolve() }, 2000)
+      proc.once('exit', () => { clearTimeout(killTimer); resolve() })
+    })
+  }
+}
+
+// Track every live app-server so a hard parent exit (uncaught error, SIGINT)
+// does not orphan child processes. Listeners are installed once, lazily.
+const liveAppServers = new Set()
+let appServerCleanupInstalled = false
+function installAppServerCleanup() {
+  if (appServerCleanupInstalled) return
+  appServerCleanupInstalled = true
+  const killAll = () => {
+    for (const server of liveAppServers) {
+      try { server.proc?.kill('SIGKILL') } catch {}
+    }
+    liveAppServers.clear()
+  }
+  // The 'exit' handler is always safe (it only reaps on actual process exit).
+  process.once('exit', killAll)
+  // Signal handlers force process.exit, which would override an embedder's own
+  // shutdown — only install them when running as the CLI, not when imported.
+  if (invokedDirectly) {
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+      try {
+        process.once(signal, () => { killAll(); process.exit(130) })
+      } catch {}
+    }
+  }
+}
+function registerLiveAppServer(server) {
+  installAppServerCleanup()
+  liveAppServers.add(server)
+}
+function unregisterLiveAppServer(server) {
+  liveAppServers.delete(server)
+}
+
+// Minimal TOML reader for Codex custom-agent files (`.codex/agents/<name>.toml`).
+// Supports the subset agent definitions use: top-level scalars, inline string
+// arrays, `[table]` / `[table.sub]` headers (for `mcp_servers.<name>`), `#`
+// comments, and `"""triple"""` / `'''triple'''` multiline strings. It is not a
+// full TOML parser — just enough to map an agent profile onto thread/start.
+function parseAgentToml(text) {
+  const root = {}
+  let current = root
+  const lines = text.split(/\r?\n/)
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    // Strip a trailing unquoted comment before detecting a table header, so
+    // `[mcp_servers.fs] # note` is still recognized as a table.
+    const codePart = stripTomlComment(trimmed)
+    const tableMatch = codePart.match(/^\[([^\]]+)\]$/)
+    if (tableMatch) {
+      const segs = tableMatch[1].split('.').map((s) => s.trim().replace(/^["']|["']$/g, ''))
+      current = root
+      for (const seg of segs) {
+        if (!current[seg] || typeof current[seg] !== 'object') current[seg] = {}
+        current = current[seg]
+      }
+      continue
+    }
+    const eq = line.indexOf('=')
+    if (eq === -1) continue
+    const key = line.slice(0, eq).trim().replace(/^["']|["']$/g, '')
+    let rest = line.slice(eq + 1).trim()
+    // Multiline triple-quoted string.
+    const tripleOpen = rest.match(/^("""|''')/)
+    if (tripleOpen) {
+      const delim = tripleOpen[1]
+      const afterOpen = rest.slice(delim.length)
+      const closeIdx = afterOpen.indexOf(delim)
+      if (closeIdx !== -1) {
+        // Opened and closed on one line; ignore any trailing content/comment.
+        current[key] = afterOpen.slice(0, closeIdx)
+        continue
+      }
+      const parts = [afterOpen]
+      let closed = false
+      while (++i < lines.length) {
+        const idx = lines[i].indexOf(delim)
+        if (idx !== -1) { parts.push(lines[i].slice(0, idx)); closed = true; break }
+        parts.push(lines[i])
+      }
+      let value = parts.join('\n')
+      if (value.startsWith('\n')) value = value.slice(1)
+      current[key] = value
+      if (!closed) break
+      continue
+    }
+    // Multiline inline array: gather until the closing ']', stripping each
+    // line's trailing comment so a `#` inside the array can't truncate it.
+    if (rest.startsWith('[') && findUnquotedChar(rest, ']') === -1) {
+      const parts = [stripTomlComment(rest)]
+      while (++i < lines.length) {
+        const code = stripTomlComment(lines[i])
+        parts.push(code)
+        if (findUnquotedChar(code, ']') !== -1) break
+      }
+      rest = parts.join(' ')
+    }
+    current[key] = parseTomlScalar(rest)
+  }
+  return root
+}
+
+function parseTomlScalar(raw) {
+  let rest = raw
+  const hash = findUnquotedChar(rest, '#')
+  if (hash !== -1) rest = rest.slice(0, hash)
+  rest = rest.trim()
+  if (rest === '') return ''
+  if (rest.startsWith('[')) {
+    // inline array; split on top-level commas (respecting quotes), not every comma
+    const close = rest.lastIndexOf(']')
+    const inner = rest.slice(1, close === -1 ? rest.length : close)
+    if (!inner.trim()) return []
+    return splitTopLevelCommas(inner).map((part) => parseTomlScalar(part.trim())).filter((v) => v !== '')
+  }
+  if ((rest.startsWith('"') && rest.endsWith('"')) || (rest.startsWith("'") && rest.endsWith("'"))) {
+    const body = rest.slice(1, -1)
+    return rest[0] === '"' ? body.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\') : body
+  }
+  if (rest === 'true') return true
+  if (rest === 'false') return false
+  if (/^-?\d+$/.test(rest)) return parseInt(rest, 10)
+  if (/^-?\d*\.\d+$/.test(rest)) return parseFloat(rest)
+  return rest
+}
+
+// Index of the first unquoted occurrence of `ch`, or -1. Quote-aware so commas,
+// `#`, and `]` inside string values are not treated as structure.
+function findUnquotedChar(text, ch) {
+  let quote = null
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (quote) { if (c === quote) quote = null; continue }
+    if (c === '"' || c === "'") { quote = c; continue }
+    if (c === ch) return i
+  }
+  return -1
+}
+
+function stripTomlComment(text) {
+  const hash = findUnquotedChar(text, '#')
+  return hash === -1 ? text : text.slice(0, hash).trim()
+}
+
+function splitTopLevelCommas(text) {
+  const parts = []
+  let quote = null
+  let depth = 0
+  let start = 0
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (quote) { if (c === quote) quote = null; continue }
+    if (c === '"' || c === "'") { quote = c; continue }
+    if (c === '[') depth++
+    else if (c === ']') depth--
+    else if (c === ',' && depth === 0) { parts.push(text.slice(start, i)); start = i + 1 }
+  }
+  parts.push(text.slice(start))
+  return parts
+}
+
+const BUILTIN_AGENT_PROFILES = {
+  default: {},
+  explorer: {
+    developerInstructions: 'Operate as a read-only exploration subagent: search and read broadly, then report findings with concrete file:line citations. Do not propose or make edits.',
+    effort: 'low',
+  },
+  worker: {
+    developerInstructions: 'Operate as an execution-focused subagent: make exactly the change requested, verify it, and report precisely what you did with concrete evidence (paths, commands, results).',
+    effort: 'medium',
+  },
+}
+
+// Resolve an `agentType` (built-in name or a `.codex/agents/<name>.toml` file in
+// the workspace or CODEX_HOME) into the subset of fields we map onto a subagent
+// thread. Returns null when the named agent cannot be found.
+async function readAgentProfile(name, workspace, codexHome) {
+  if (Object.prototype.hasOwnProperty.call(BUILTIN_AGENT_PROFILES, name)) {
+    return { ...BUILTIN_AGENT_PROFILES[name] }
+  }
+  const candidates = [
+    path.join(workspace, '.codex', 'agents', `${name}.toml`),
+    ...(codexHome ? [path.join(codexHome, 'agents', `${name}.toml`)] : []),
+    path.join(os.homedir(), '.codex', 'agents', `${name}.toml`),
+  ]
+  for (const file of candidates) {
+    let text
+    try { text = await fs.readFile(file, 'utf8') } catch { continue }
+    const toml = parseAgentToml(text)
+    const profile = {}
+    if (typeof toml.developer_instructions === 'string') profile.developerInstructions = toml.developer_instructions.trim()
+    if (typeof toml.model === 'string') profile.model = toml.model
+    if (typeof toml.model_reasoning_effort === 'string') profile.effort = toml.model_reasoning_effort
+    if (typeof toml.sandbox_mode === 'string') profile.sandbox = toml.sandbox_mode
+    if (toml.mcp_servers && typeof toml.mcp_servers === 'object') profile.mcpServers = toml.mcp_servers
+    profile.source = file
+    return profile
+  }
+  return null
+}
+
+// Merge an agent()'s options (agentType profile + explicit instructions / effort
+// / mcpServers / tools) into the parameters a subagent thread needs. Explicit
+// per-call options win over the agentType profile.
+async function resolveAgentSettings(opts, { workspace, codexHome, sandbox, transport }) {
+  let developerInstructions = typeof opts.instructions === 'string' && opts.instructions.trim() ? opts.instructions.trim() : null
+  let effort = normalizeEffort(opts.effort)
+  let mcpServers = null
+  let profileModel = null
+  let profileSandbox = null
+  if (opts.agentType !== undefined && opts.agentType !== null) {
+    const profile = await readAgentProfile(String(opts.agentType), workspace, codexHome)
+    if (!profile) {
+      throw new Error(`agentType '${opts.agentType}' not found (looked for built-ins default/worker/explorer and .codex/agents/${opts.agentType}.toml in the workspace and CODEX_HOME)`)
+    }
+    if (!developerInstructions && profile.developerInstructions) developerInstructions = profile.developerInstructions
+    if (!effort && profile.effort) effort = normalizeEffort(profile.effort)
+    if (profile.model) profileModel = profile.model
+    if (profile.sandbox) profileSandbox = profile.sandbox
+    if (profile.mcpServers) mcpServers = profile.mcpServers
+  }
+  const toolsOpt = opts.mcpServers || opts.tools
+  if (toolsOpt && typeof toolsOpt === 'object') mcpServers = { ...(mcpServers || {}), ...toolsOpt }
+  if (transport !== 'appserver' && mcpServers && Object.keys(mcpServers).length) {
+    throw new Error('mcpServers/tools (and agentType profiles that declare mcp_servers) require the app-server transport; drop them or use --transport appserver (the default)')
+  }
+  return {
+    developerInstructions,
+    effort,
+    mcpServers,
+    profileModel,
+    sandbox: clampSandbox(profileSandbox, sandbox),
+  }
+}
+
+// Transport dispatcher: app-server subagent (default) or `codex exec` fallback.
+async function runChildAgent(params) {
+  const {
+    transport, appServer, prompt, schema, agentId, subagentDir, workspace, sandbox,
+    codexBin, childModel, effort, developerInstructions, mcpServers, configOverrides,
+    isolation = 'shared', schemaRetries,
+  } = params
+  if (transport === 'appserver' && appServer) {
+    await fs.writeFile(
+      path.join(subagentDir, `agent-${agentId}.meta.json`),
+      JSON.stringify({ agentId, transport: 'appserver', workspace, sandbox, isolation, model: childModel || null, effort: effort || null, schemaPath: null, startedAt: new Date().toISOString() }, null, 2)
+    ).catch(() => {})
+    const { result, tokens } = await appServer.runAgent({
+      prompt, schema, model: childModel, effort, developerInstructions, mcpServers, configOverrides,
+      cwd: workspace, sandbox, schemaRetries,
+    })
+    await fs.writeFile(
+      path.join(subagentDir, `agent-${agentId}.final.txt`),
+      typeof result === 'string' ? result : JSON.stringify(result, null, 2)
+    ).catch(() => {})
+    return { result, tokens }
+  }
+  // exec fallback: fold developer instructions into the prompt; model/effort via flags.
+  const execPrompt = developerInstructions ? `${developerInstructions}\n\n${prompt}` : prompt
+  const attempts = schema ? Math.max(1, (Number.isInteger(schemaRetries) ? schemaRetries : 1) + 1) : 1
+  let lastError = null
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const result = await runChildCodex({ prompt: execPrompt, schema, agentId, subagentDir, workspace, sandbox, codexBin, childModel, effort, isolation })
+      return { result, tokens: null }
+    } catch (error) {
+      lastError = error
+      // Only retry schema-shape failures (matching the app-server transport);
+      // a process crash or non-schema error fails immediately.
+      if (!error.schemaViolation || attempt === attempts - 1) throw error
+    }
+  }
+  throw lastError
+}
+
+// Frame every child subagent run so its final message is consumed as a return
+// value. This mirrors the Pi extension's structured output contract (final
+// action must be the machine-readable result, no trailing prose) and Claude Code
+// workflow agents being told their final text is a return value, adapted to
+// Codex's native `outputSchema` (app-server) / `--output-schema` (exec).
 function buildChildPrompt(prompt, { schema, label, phase } = {}) {
   const header =
     'You are an isolated subagent in a Codex dynamic workflow run by a parent orchestrator. ' +
@@ -1884,7 +2541,7 @@ function buildChildPrompt(prompt, { schema, label, phase } = {}) {
   return [header, context.join('\n'), prompt, contract].filter((part) => part && part.trim()).join('\n\n')
 }
 
-async function runChildCodex({ prompt, schema, agentId, subagentDir, workspace, sandbox, codexBin, childModel, isolation = 'shared' }) {
+async function runChildCodex({ prompt, schema, agentId, subagentDir, workspace, sandbox, codexBin, childModel, effort, isolation = 'shared' }) {
   const finalPath = path.join(subagentDir, `agent-${agentId}.final.txt`)
   const eventsPath = path.join(subagentDir, `agent-${agentId}.jsonl`)
   const stderrPath = path.join(subagentDir, `agent-${agentId}.stderr.txt`)
@@ -1908,6 +2565,7 @@ async function runChildCodex({ prompt, schema, agentId, subagentDir, workspace, 
     args.push('--output-schema', schemaPath)
   }
   if (childModel) args.push('--model', childModel)
+  if (effort) args.push('-c', `model_reasoning_effort=${JSON.stringify(String(effort))}`)
   args.push('-')
   await fs.writeFile(metaPath, JSON.stringify({ agentId, workspace, sandbox, isolation, schemaPath, startedAt: new Date().toISOString() }, null, 2))
   const { code, stdout, stderr } = await spawnCapture(codexBin, args, prompt)
@@ -1918,10 +2576,15 @@ async function runChildCodex({ prompt, schema, agentId, subagentDir, workspace, 
   }
   const finalText = await fs.readFile(finalPath, 'utf8')
   if (!schema) return finalText.trim()
-  const parsed = parseJsonOutput(finalText)
+  let parsed
+  try {
+    parsed = parseJsonOutput(finalText)
+  } catch (error) {
+    throw Object.assign(new Error(`Structured child output was not JSON: ${error.message}`), { schemaViolation: true })
+  }
   const violations = validateAgainstSchema(parsed, schema, 'result')
   if (violations.length) {
-    throw new Error(`Structured child output did not satisfy the schema: ${violations.slice(0, 5).join('; ')}`)
+    throw Object.assign(new Error(`Structured child output did not satisfy the schema: ${violations.slice(0, 5).join('; ')}`), { schemaViolation: true })
   }
   return parsed
 }
@@ -2163,6 +2826,13 @@ async function main() {
     if (!allowedSandboxes.has(sandbox)) {
       throw new Error(`--sandbox must be one of read-only, workspace-write, danger-full-access (got: ${sandbox})`)
     }
+    const transport = opts.transport || resumeSnapshot?.transport || 'appserver'
+    if (transport !== 'appserver' && transport !== 'exec') {
+      throw new Error(`--transport must be one of appserver, exec (got: ${transport})`)
+    }
+    const schemaRetries = opts['schema-retries'] !== undefined
+      ? Math.max(0, Number(opts['schema-retries']) || 0)
+      : (Number.isInteger(resumeSnapshot?.schemaRetries) ? resumeSnapshot.schemaRetries : 1)
     const childModel = opts['child-model'] || resumeSnapshot?.childModel
     const resumeAgentLimit = resumeSnapshot?.agentLimit
     const hasPersistedAgentUsage = resumeDir && Number.isInteger(resumeAgentLimit?.used)
@@ -2176,6 +2846,8 @@ async function main() {
       runId,
       args: resolvedArgs,
       sandbox,
+      transport,
+      schemaRetries,
       codexBin: opts['codex-bin'] || 'codex',
       childModel,
       maxConcurrency: Number(opts['max-concurrency'] || maxDefault),
@@ -2202,7 +2874,7 @@ async function main() {
 }
 
 // Exported for unit tests; importing the module must not run the CLI.
-export { parseWorkflowScript, inspectScript, buildChildPrompt, evaluateLiteral, validateMeta, validateAgainstSchema }
+export { parseWorkflowScript, inspectScript, buildChildPrompt, evaluateLiteral, validateMeta, validateAgainstSchema, parseAgentToml, clampSandbox, normalizeEffort, readAgentProfile }
 
 const invokedDirectly = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
