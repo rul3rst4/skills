@@ -70,17 +70,19 @@ If a workflow is run from inside another sandboxed Codex child, nested `codex ex
 
 ## Quick Start
 
-Use the bundled runtime directly:
+Use the bundled runtime directly. In a standard Codex skill install, set:
 
 ```bash
-node /Users/andersonkulitch/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs inspect path/to/workflow.js
-node /Users/andersonkulitch/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs run path/to/workflow.js --workspace "$PWD"
+RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs"
+node "$RUNNER" inspect path/to/workflow.js
+node "$RUNNER" run path/to/workflow.js --workspace "$PWD"
 ```
 
 Create a throughput workflow starter:
 
 ```bash
-node /Users/andersonkulitch/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs template throughput \
+RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs"
+node "$RUNNER" template throughput \
   --target "$PWD" \
   --objective "Increase throughput of the app" \
   --output .codex-workflows/authored/throughput-workflow.js
@@ -97,7 +99,8 @@ The runner creates `.codex-workflows/<runId>/` by default. Each run contains:
 Resume from an existing run directory:
 
 ```bash
-node /Users/andersonkulitch/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs run --resume .codex-workflows/wf_abc123def456
+RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs"
+node "$RUNNER" run --resume .codex-workflows/wf_abc123def456
 ```
 
 Completed `agent()` calls with the same prompt and normalized options are returned from the journal cache.
@@ -148,7 +151,8 @@ The VM blocks `Date.now()`, argless `new Date()`, `Math.random()`, `require`, `p
 Use real child Codex delegation for validation:
 
 ```bash
-node /Users/andersonkulitch/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs run workflow.js \
+RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs"
+node "$RUNNER" run workflow.js \
   --workspace "$PWD" \
   --sandbox read-only \
   --max-concurrency 4 \
@@ -158,7 +162,8 @@ node /Users/andersonkulitch/.codex/skills/codex-workflow-runner/scripts/codex_wo
 Use mock mode only for runtime smoke tests:
 
 ```bash
-node /Users/andersonkulitch/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs run workflow.js --mock-agent
+RUNNER="$HOME/.codex/skills/codex-workflow-runner/scripts/codex_workflow_runner.mjs"
+node "$RUNNER" run workflow.js --mock-agent
 ```
 
 Use `--json` when another tool needs machine-readable output.

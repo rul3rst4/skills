@@ -1,2 +1,3 @@
-references
 .DS_Store
+.codex-workflows/
+node_modules/
