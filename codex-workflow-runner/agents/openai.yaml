@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Workflow Runner"
-  short_description: "Author and run Codex workflows"
-  default_prompt: "Use $codex-workflow-runner to create and run a Codex-orchestrated workflow for this task."
+  short_description: "Orchestrate native or portable Codex workflows"
+  default_prompt: "Use $codex-workflow-runner to create and run a Codex-native or portable workflow for this task."
