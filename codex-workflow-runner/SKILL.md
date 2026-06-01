@@ -82,7 +82,8 @@ Runtime globals:
 - `pipeline(items, ...stages)`: default multi-stage shape. Each item moves through stages independently; no stage-wide barrier. A returned `null` or thrown stage drops only that item to `null`.
 - `phase(title)` and `log(message)`: progress grouping and run logs.
 - `workflow(ref, args)`: run one child workflow by script path or `{ scriptPath, cacheKey }`. Nesting is limited to one level.
-- `args`, `cwd` / `process.cwd()`, and `budget`: run args, workspace path, and budget helpers.
+- `args`, `cwd` / `process.cwd()`: run args and the workspace path.
+- `budget`: `{ total, spent(), remaining() }`. `total` is the `--budget-tokens` value or `null`; `spent()` is tokens used so far; `remaining()` is `max(0, total - spent())`, or `Infinity` when no budget was set. It is a hard ceiling: when the next call's estimated tokens will not fit, `agent()` and `workflow()` throw `Workflow budget exhausted`. Guard budget-scaled loops on `budget.total` — with no budget, `remaining()` is `Infinity` and the loop never stops. See [Verification And Scaling Patterns](#verification-and-scaling-patterns) for the loop shape.
 
 Schema note: `opts.schema` is passed as native output schema and then validated locally. The local validator supports the subset this runner uses: `type`, `enum`, `const`, `required`, `properties`, `additionalProperties:false`, and non-tuple `items`. Do not rely on complex JSON Schema keywords unless you verify the runner supports them. Schema success proves shape, not truth.
 
@@ -157,6 +158,10 @@ const failedAssessments = assessments
   .filter(Boolean)
 if (failedAssessments.length) throw new Error(`assessment failed: ${failedAssessments.join(', ')}`)
 
+// Barrier: we rank across ALL findings and verify only the top slice, so the
+// complete assessment set must exist first. This is the justified-barrier case
+// from Design The Loop, not the pipeline() default. `unverified` (returned
+// below) logs what the slice drops so coverage stays honest.
 const findings = assessments.flatMap(result => result.findings)
 const toVerify = findings.slice(0, 8)
 
@@ -200,6 +205,23 @@ Before authoring, answer these six questions:
 
 Default to `pipeline()` for per-item multi-stage work. Use a `parallel()` barrier only when the next step needs the whole prior set, such as dedupe, ranking, judging, or "zero findings means skip verification." Every fan-out where coverage matters must map `null` back to labels and throw or return an explicit `incomplete` list.
 
+When each item flows through its stages independently — no step needs the whole prior set — use `pipeline()` so item B can reach Verify while item A is still in Scan:
+
+```js
+// The pipeline() default: per-file scan -> verify, no barrier between stages.
+const reviewed = await pipeline(
+  changedFiles, // e.g. ['src/a.ts', 'src/b.ts'] — scouted by the parent first
+  (file) => agent(`Review ${file} for correctness. Cite file:line evidence.`, {
+    label: `scan:${file}`, phase: 'Scan', agentType: 'explorer', schema: FINDINGS_SCHEMA,
+  }),
+  (scan, file) => agent(`Refute the weakest finding in ${file}:\n${JSON.stringify(scan.findings)}`, {
+    label: `verify:${file}`, phase: 'Verify', agentType: 'explorer', schema: VERDICT_SCHEMA,
+  }),
+)
+```
+
+Each stage receives `(prevResult, originalItem, index)`, so later stages can label work by the original item without threading it through earlier returns. A stage that returns `null` or throws drops only that item to `null`. The skeleton above instead uses `parallel()` barriers because it ranks across all findings and verifies only a top slice — the justified-barrier case.
+
 Common shapes are consequences of the loop, not templates to force:
 
 - Assess -> Verify -> Synthesize for reviews and audits.
@@ -219,6 +241,41 @@ Subagents do not share parent context. Every prompt should include:
 - skeptical defaults for verifiers: refute weak claims, do not infer missing evidence.
 
 Use short unique labels like `scan:auth`, `verify:bug-3`, or `fix:parser`. Use `schema` for any result another stage consumes. Keep schemas small and semantic: findings need ids, locations, evidence, confidence, and suggested parent action; verdicts need checked locations, whether the claim survives, and why.
+
+## Verification And Scaling Patterns
+
+Reusable techniques, not templates to force — each is a consequence of the loop you designed. Several already appear in the skeleton; reuse those rather than re-deriving them.
+
+- **Adversarial refute.** Verify a finding by trying to kill it, not confirm it: the verifier opens the cited code, defaults to "refuted" on uncertainty, and the finding survives only if it cannot be refuted. For high-stakes claims, run N refuters and keep the finding on a majority survival. (The skeleton's Verify phase is the single-refuter form.)
+- **Perspective-diverse lenses.** Fan out distinct lenses (correctness, tests, operability, security, performance) instead of N identical scanners — diversity catches failure modes redundancy misses. (The skeleton's `LENSES` is this.)
+- **Judge panel.** For design or fix choices: generate N independent options from different angles (e.g. MVP-first, risk-first, perf-first), score them with parallel judges, then implement the winner while grafting the best ideas from the runners-up.
+- **Loop-until-dry.** For unknown-size discovery, keep spawning finders until K consecutive rounds surface nothing new. Dedup against a `seen` set, not against accepted items, or rejected findings reappear every round and the loop never converges:
+
+  ```js
+  const seen = new Set(); const accepted = []; let dry = 0
+  while (dry < 2) {
+    const round = (await parallel(FINDERS.map(f => () =>
+      agent(f.prompt, { phase: 'Find', agentType: 'explorer', schema: FINDINGS_SCHEMA })))
+    ).filter(Boolean).flatMap(r => r.findings)
+    const fresh = round.filter(x => !seen.has(x.id))
+    if (!fresh.length) { dry++; continue }
+    dry = 0; fresh.forEach(x => seen.add(x.id)); accepted.push(...fresh)
+  }
+  ```
+
+- **Loop-until-budget.** Scale depth to `--budget-tokens`. Guard on `budget.total` so the loop is bounded only when a budget exists:
+
+  ```js
+  while (budget.total && budget.remaining() > 50_000) {
+    const round = await agent('Find one more high-signal issue. Cite file:line.', { schema: FINDINGS_SCHEMA })
+    if (!round?.findings?.length) break
+    findings.push(...round.findings)
+    log(`${findings.length} findings, ${Math.round(budget.remaining() / 1000)}k tokens left`)
+  }
+  ```
+
+- **Completeness critic.** End a sweep with one agent whose only job is to ask "what was missed — a path not scanned, a claim unverified, a source unread?" Feed its answer into the next round.
+- **No silent caps.** When you bound fan-out (`slice`, top-N, sampling, no-retry), `log()` it and return what you dropped so the parent knows coverage is partial. (The skeleton returns `unverified` for exactly this.)
 
 ## Semantics Not To Forget
 
@@ -274,6 +331,21 @@ When things fail:
 - Completed but suspicious: count null branches, audit citations, and reject claims without evidence.
 - Schema failures: simplify or correct the schema, strengthen prompt fields, or raise `--schema-retries` only when the schema is right.
 - App-server fallback or nested-sandbox errors: check `workflow.json.transport`, logs, stderr/meta artifacts, and rerun from the top-level Codex session when infrastructure blocked delegation.
+
+## Pre-Flight Checklist
+
+Before spending model work on a real run:
+
+1. **Scouted inline** — read cwd, `rg --files`, diffs, tests, failing commands. Not fanning out blind.
+2. **`meta` is a literal** with non-empty `name` and `description`; no calls, spreads, computed keys, or interpolation.
+3. **Loop is designed** — unit of work, truth source, gate, and failure mode are explicit (see Design The Loop).
+4. **`pipeline()` by default**; every `parallel()` barrier is justified (dedupe, rank, judge, or zero-findings skip).
+5. **`schema` on every result a later stage consumes**, kept to the supported validator subset.
+6. **Coverage is tracked** — `null` branches mapped back to labels; the workflow throws or returns an explicit `incomplete`/`unverified` list.
+7. **Sandbox fits the work** — `--sandbox read-only` for assess/review/research; `workspace-write` only for narrow, approved fixers; mutation file-disjoint with one serialized integrator.
+8. **Determinism honored** — no `Date.now()`, argless `Date()`, `Math.random()`, `require`, timers, or direct file reads in the script.
+9. **`inspect` run** (and optionally `--mock-agent`) to catch parse, determinism, or fan-out problems before paying for model work.
+10. **After the run, read `workflow.json`** — `status`, `transport`, null branches, and the structured `result` — not just terminal output.
 
 ## References
 
