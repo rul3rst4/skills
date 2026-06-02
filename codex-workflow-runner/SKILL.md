@@ -222,13 +222,6 @@ const reviewed = await pipeline(
 
 Each stage receives `(prevResult, originalItem, index)`, so later stages can label work by the original item without threading it through earlier returns. A stage that returns `null` or throws drops only that item to `null`. The skeleton above instead uses `parallel()` barriers because it ranks across all findings and verifies only a top slice — the justified-barrier case.
 
-Common shapes are consequences of the loop, not templates to force:
-
-- Assess -> Verify -> Synthesize for reviews and audits.
-- Probe -> Dedup -> Fix -> Gate for failing commands or runtime signatures.
-- Panel -> Judge -> Implement/Document for design choices.
-- Classify -> Sample/Dispute Verify -> Synthesize for large taxonomies.
-
 ## Child Prompts And Schemas
 
 Subagents do not share parent context. Every prompt should include:
