@@ -1,0 +1,4 @@
+interface:
+  display_name: "HTML Artifact Output"
+  short_description: "Design rich, interactive HTML artifacts for any subject"
+  default_prompt: "Use $html-artifact-output to design a rich, interactive HTML artifact that brings this idea to life."

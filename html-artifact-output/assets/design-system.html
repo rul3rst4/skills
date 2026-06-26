@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTML Output — Design System Reference</title>
+<!--
+  Portable design-system reference for prompting Claude to produce rich HTML.
+  Keep this file in your repo and tell Claude: "match the house style in design-system.html".
+  Swap the palette to rebrand; keep the structure
+  (warm base, serif headings, hairline borders, flat, one accent).
+-->
+<style>
+  :root{
+    --ivory:#FAF9F5; --slate:#141413; --white:#FFFFFF;
+    --gray-100:#F0EEE6; --gray-300:#D1CFC5; --gray-500:#87867F; --gray-700:#3D3D3A;
+    --clay:#D97757; --oat:#E3DACC;
+    --success:#788C5D; --warning:#C78E3F; --danger:#B04A4A; --info:#5C7CA3;
+    --serif:ui-serif,Georgia,'Times New Roman',serif;
+    --sans:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+    --mono:ui-monospace,'SF Mono',Menlo,Monaco,monospace;
+    --radius-row:8px; --radius-panel:12px; --border:1.5px solid var(--gray-300);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:56px 24px 96px;background:var(--ivory);color:var(--slate);
+    font-family:var(--sans);font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased}
+  .page{max-width:860px;margin:0 auto}
+  header h1{font-family:var(--serif);font-weight:500;font-size:40px;letter-spacing:-.02em;margin:0 0 6px}
+  header .sub{color:var(--gray-500);font-size:14px;margin:0 0 48px}
+  section{margin-bottom:56px}
+  h2{font-family:var(--serif);font-weight:500;font-size:26px;letter-spacing:-.01em;margin:0 0 8px}
+  hr.rule{border:none;border-top:1px solid var(--gray-300);margin:0 0 24px}
+  .eyebrow{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+    color:var(--gray-500);margin-bottom:12px}
+
+  /* color */
+  .swatches{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:18px}
+  .chip{height:60px;border-radius:var(--radius-row);border:var(--border);margin-bottom:8px}
+  .hex{font-family:var(--mono);font-size:12px;color:var(--gray-700);display:block}
+  .tok{font-family:var(--mono);font-size:11px;color:var(--gray-500);display:block}
+
+  /* type */
+  .scale{background:var(--white);border:var(--border);border-radius:var(--radius-panel);overflow:hidden}
+  .row{display:flex;align-items:baseline;justify-content:space-between;gap:24px;
+    padding:18px 22px;border-bottom:1px solid var(--gray-100)}
+  .row:last-child{border-bottom:none}
+  .meta{font-family:var(--mono);font-size:12px;color:var(--gray-500);white-space:nowrap}
+  .d{font-family:var(--serif);font-size:44px;font-weight:500;letter-spacing:-.02em;line-height:1.1}
+  .h{font-family:var(--serif);font-size:28px;font-weight:500;letter-spacing:-.01em}
+  .b{font-family:var(--sans);font-size:16px}
+  .c{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--gray-500)}
+
+  /* components */
+  .stage{display:flex;flex-wrap:wrap;align-items:center;gap:14px;padding:22px;
+    background:var(--white);border:var(--border);border-radius:var(--radius-panel)}
+  .btn{display:inline-flex;align-items:center;height:36px;padding:0 16px;font:500 14px var(--sans);
+    border-radius:var(--radius-row);border:1.5px solid transparent;cursor:pointer;
+    transition:background .12s ease,border-color .12s ease}
+  .btn.primary{background:var(--clay);color:#fff}
+  .btn.primary:hover{background:#C7684C}
+  .btn.secondary{background:#fff;color:var(--slate);border-color:var(--gray-300)}
+  .btn.secondary:hover{background:var(--gray-100)}
+  .btn.ghost{background:transparent;color:var(--gray-700)}
+  .input{height:38px;padding:0 12px;font:14px var(--sans);color:var(--slate);background:#fff;
+    border:var(--border);border-radius:var(--radius-row);width:240px;outline:none;
+    transition:border-color .12s ease,box-shadow .12s ease}
+  .input:focus{border-color:var(--clay);box-shadow:0 0 0 3px rgba(217,119,87,.15)}
+  .badge{display:inline-flex;align-items:center;height:22px;padding:0 9px;font-size:12px;
+    font-weight:500;border-radius:999px}
+  .badge.neutral{background:var(--gray-100);color:var(--gray-700)}
+  .badge.accent{background:rgba(217,119,87,.14);color:var(--clay)}
+  .badge.ok{background:rgba(120,140,93,.16);color:var(--success)}
+  .badge.warn{background:rgba(199,142,63,.16);color:#A06A2A}
+  .badge.danger{background:rgba(176,74,74,.14);color:var(--danger)}
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>Design system reference</h1>
+    <p class="sub">Tell Claude to match this when generating HTML. Warm base · serif headings ·
+      hairline borders · flat · one accent · mono micro-labels.</p>
+  </header>
+
+  <section>
+    <h2>Color</h2><hr class="rule">
+    <div class="eyebrow">Base &amp; accent</div>
+    <div class="swatches">
+      <div><div class="chip" style="background:#FAF9F5"></div><span class="hex">#FAF9F5</span><span class="tok">--ivory (page)</span></div>
+      <div><div class="chip" style="background:#141413"></div><span class="hex">#141413</span><span class="tok">--slate (text)</span></div>
+      <div><div class="chip" style="background:#FFFFFF"></div><span class="hex">#FFFFFF</span><span class="tok">--white (cards)</span></div>
+      <div><div class="chip" style="background:#D97757"></div><span class="hex">#D97757</span><span class="tok">--clay (accent)</span></div>
+      <div><div class="chip" style="background:#E3DACC"></div><span class="hex">#E3DACC</span><span class="tok">--oat</span></div>
+    </div>
+    <div class="eyebrow" style="margin-top:24px">Warm grays &amp; semantics</div>
+    <div class="swatches">
+      <div><div class="chip" style="background:#F0EEE6"></div><span class="hex">#F0EEE6</span><span class="tok">--gray-100</span></div>
+      <div><div class="chip" style="background:#D1CFC5"></div><span class="hex">#D1CFC5</span><span class="tok">--gray-300</span></div>
+      <div><div class="chip" style="background:#87867F"></div><span class="hex">#87867F</span><span class="tok">--gray-500</span></div>
+      <div><div class="chip" style="background:#788C5D"></div><span class="hex">#788C5D</span><span class="tok">--success</span></div>
+      <div><div class="chip" style="background:#C78E3F"></div><span class="hex">#C78E3F</span><span class="tok">--warning</span></div>
+      <div><div class="chip" style="background:#B04A4A"></div><span class="hex">#B04A4A</span><span class="tok">--danger</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Typography</h2><hr class="rule">
+    <div class="scale">
+      <div class="row"><span class="d">Plan the week ahead</span><span class="meta">serif · 44 / 500 / -.02em</span></div>
+      <div class="row"><span class="h">Plan the week ahead</span><span class="meta">serif · 28 / 500 / -.01em</span></div>
+      <div class="row"><span class="b">Review milestones, assign owners, surface blockers early.</span><span class="meta">sans · 16 / 1.55</span></div>
+      <div class="row"><span class="c">Updated 2 hours ago</span><span class="meta">mono · 11 / upper / +.08em</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Components</h2><hr class="rule">
+    <div class="eyebrow">Buttons</div>
+    <div class="stage" style="margin-bottom:16px">
+      <button class="btn primary">Primary</button>
+      <button class="btn secondary">Secondary</button>
+      <button class="btn ghost">Ghost</button>
+      <input class="input" placeholder="Search…">
+    </div>
+    <div class="eyebrow">Badges (tinted pills, not loud fills)</div>
+    <div class="stage">
+      <span class="badge neutral">Draft</span>
+      <span class="badge accent">In review</span>
+      <span class="badge ok">Done</span>
+      <span class="badge warn">Overdue</span>
+      <span class="badge danger">Blocking</span>
+    </div>
+  </section>
+</div>
+</body>
+</html>
